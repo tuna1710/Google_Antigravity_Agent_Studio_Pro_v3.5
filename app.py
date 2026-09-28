@@ -20,6 +20,8 @@ import os
 import sys
 import json
 import re
+import time
+import datetime
 import uuid
 import shutil
 import base64
@@ -658,6 +660,17 @@ def clean_all_cloud_sandboxes(api_key: str, sessions):
     except Exception as e:
         return sessions, gr.update(), gr.update(), f"❌ Lỗi khi dọn dẹp: {str(e)}", gr.update()
 
+# --- Hàm lấy thời gian hiện tại định dạng chuẩn (Múi giờ Việt Nam UTC+7) ---
+def get_current_time_str():
+    """Lấy thời gian hiện tại theo định dạng HH:MM:SS • DD/MM/YYYY (múi giờ Việt Nam GMT+7)"""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    except Exception:
+        tz_offset = datetime.timezone(datetime.timedelta(hours=7))
+        now = datetime.datetime.now(tz_offset)
+    return now.strftime("%H:%M:%S • %d/%m/%Y")
+
 # --- Quản lý Lưu trữ / Phục hồi Phiên làm việc (Session Persistence) ---
 def get_session_choices(sessions):
     """Trả về danh sách tuple (Display Name, Session ID) để Dropdown hiển thị tên nhưng binding theo ID duy nhất"""
@@ -737,7 +750,8 @@ def export_session_markdown(sessions, cur_id):
     for turn in history:
         role = turn.get("role", "user")
         content = turn.get("content", "")
-        lines.append(f"### {'👤 Bạn' if role == 'user' else '🛸 Agent'}:\n{content}\n")
+        time_info = f" *(🕒 {turn['time']})*" if "time" in turn else ""
+        lines.append(f"### {'👤 Bạn' if role == 'user' else '🛸 Agent'}{time_info}:\n{content}\n")
     safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in sess_name)
     export_path = f"/content/{safe_name}_{cur_id[:6]}.md"
     try:
@@ -1362,8 +1376,10 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
         elif not image_previews and not file_previews:
             display_parts.append("*(Tin nhắn trống)*")
 
-        display_content = "<br><br>".join(display_parts)
-        new_history = history + [{"role": "user", "content": display_content}]
+        now_str = get_current_time_str()
+        time_tag = f'<div style="text-align: right; font-size: 0.78rem; opacity: 0.65; margin-top: 6px;">🕒 {now_str}</div>'
+        display_content = "<br><br>".join(display_parts) + time_tag
+        new_history = history + [{"role": "user", "content": display_content, "time": now_str}]
 
         # Lưu trạng thái tệp và câu hỏi vào phiên
         sessions[cur_id]["history"] = new_history
@@ -1424,13 +1440,19 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
         else:
             agent_input = effective_prompt_text or "Hello"
 
+        start_ts = time.time()
+        start_time_str = get_current_time_str()
         files_info_str = f" [Đính kèm {len(pending_files)} tệp]" if pending_files else ""
         skills_count = len(current_skills)
         if skills_count > 0:
             files_info_str += f" với {skills_count} Kỹ năng"
 
-        history.append({"role": "assistant", "content": f"⏳ *Agent (`{chosen_agent}`){files_info_str} đang xử lý và thực thi trên Cloud Sandbox...*"})
-        yield history, sessions, f"⏳ *Đang kết nối siêu máy chủ Google Cloud ({chosen_agent})...*", gr.update()
+        history.append({
+            "role": "assistant",
+            "content": f"⏳ *Agent (`{chosen_agent}`){files_info_str} đang xử lý và thực thi trên Cloud Sandbox...* (🕒 {start_time_str})",
+            "time": start_time_str
+        })
+        yield history, sessions, f"⏳ *Đang kết nối siêu máy chủ Google Cloud ({chosen_agent})...* (🕒 {start_time_str})", gr.update()
 
         # Dọn dẹp trạng thái pending
         sessions[cur_id]["pending_images"] = []
@@ -1480,7 +1502,13 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
             final_reply = f"{auto_notice}{steps_markdown}{final_output}" if steps_markdown else f"{auto_notice}{final_output}"
 
+            elapsed_sec = time.time() - start_ts
+            finish_time_str = get_current_time_str()
+            time_footer = f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 8px; border-top: 1px dashed rgba(128,128,128,0.25); padding-top: 4px;">🕒 <i>Hoàn thành: {finish_time_str} • Thời gian xử lý: {elapsed_sec:.1f}s</i></div>'
+            final_reply = f"{final_reply}{time_footer}"
+
             history[-1]["content"] = final_reply
+            history[-1]["time"] = finish_time_str
             sessions[cur_id]["history"] = history
 
             env_info = f"🌐 **Sandbox ID:** `{agent_sess.env_id}` (Lượt #{agent_sess.step} | Agent: `{chosen_agent}` | Skills: {len(current_skills)})"
@@ -1488,6 +1516,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             yield history, sessions, env_info, sb_badge
 
         except Exception as e:
+            elapsed_sec = time.time() - start_ts
+            err_time_str = get_current_time_str()
             err_str = str(e)
             if "429" in err_str:
                 history[-1]["content"] = "⚠️ **Hạn mức tài khoản bị giới hạn (HTTP 429)**: Vui lòng đợi 30 giây rồi thử lại, hoặc mở phần **Quản lý Sandbox** để xóa bớt Sandbox."
@@ -1495,6 +1525,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                 history[-1]["content"] = "⚠️ **Máy chủ Google tạm bận (HTTP 503)**: Đang có lượng truy cập cao, bạn vui lòng gửi lại sau vài giây."
             else:
                 history[-1]["content"] = f"❌ **Lỗi thực thi**: {err_str}"
+            history[-1]["content"] += f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 6px;">🕒 <i>{err_time_str} • Thời gian xử lý: {elapsed_sec:.1f}s</i></div>'
+            history[-1]["time"] = err_time_str
             sessions[cur_id]["history"] = history
             yield history, sessions, "❌ *Lỗi thực thi*", gr.update()
 
