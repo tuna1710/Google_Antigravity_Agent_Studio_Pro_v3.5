@@ -1,0 +1,46 @@
+# Python cache & virtual environment
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Secret & Environment variables (DO NOT COMMIT)
+.env
+*.pem
+*.key
+credentials.json
+
+# Local runtime data
+backup/
+storage/
+downloads/
+/content/
+*.log
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
