@@ -19,6 +19,7 @@ except ImportError:
 import os
 import sys
 import json
+import re
 import uuid
 import shutil
 import base64
@@ -239,22 +240,67 @@ def get_current_env_id(cur_id, sessions=None):
         return sessions[cur_id].get("env_id")
     return None
 
+# --- Hàm Tải tệp lên Cloud Sandbox bền bỉ 2 lớp (SDK + REST API Fallback) ---
+def upload_file_to_cloud_sandbox(api_key: str, env_id: str, remote_path: str, data_bytes: bytes, mime_type: str = None) -> tuple[bool, str]:
+    """
+    Tải tệp lên Sandbox Google Cloud với 2 tầng bảo vệ:
+    Tầng 1: Thử qua SDK google-genai (client.environments.files.upload)
+    Tầng 2: Fallback trực tiếp qua REST API (PUT /upload/v1beta/environments/{clean_env}/files/{clean_path}?overwrite=true)
+    """
+    if not api_key or not env_id or not remote_path or data_bytes is None:
+        return False, "Thiếu thông số (api_key, env_id, remote_path hoặc data)"
+
+    clean_env = env_id.replace("environments/", "").strip()
+    clean_path = remote_path.lstrip("/")
+    if not mime_type:
+        mime_type = mimetypes.guess_type(clean_path)[0] or "application/octet-stream"
+
+    err_log = []
+
+    # 1. Thử qua google-genai SDK
+    try:
+        client = genai.Client(api_key=api_key)
+        if hasattr(client, "environments") and hasattr(client.environments, "files") and hasattr(client.environments.files, "upload"):
+            client.environments.files.upload(
+                environment=clean_env,
+                path=clean_path,
+                file=data_bytes,
+                mime_type=mime_type,
+                overwrite=True
+            )
+            return True, f"Tải lên thành công qua SDK: `{clean_path}`"
+        else:
+            err_log.append("SDK Client không có thuộc tính environments.files.upload")
+    except Exception as e:
+        err_log.append(f"SDK error: {str(e)}")
+
+    # 2. Fallback REST API trực tiếp đến Google Cloud API
+    try:
+        url = f"https://generativelanguage.googleapis.com/upload/v1beta/environments/{clean_env}/files/{clean_path}?overwrite=true"
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": mime_type,
+        }
+        res = requests.put(url, headers=headers, data=data_bytes, timeout=60)
+        if res.status_code in (200, 201):
+            return True, f"Tải lên thành công qua REST API: `{clean_path}`"
+        else:
+            err_log.append(f"REST API ({res.status_code}): {res.text}")
+    except Exception as e:
+        err_log.append(f"REST API error: {str(e)}")
+
+    return False, f"Không thể tải tệp lên: {'; '.join(err_log)}"
+
 # Đồng bộ trực tiếp Skill mới vào Sandbox đang chạy
 def sync_skill_to_active_sandbox(api_key: str, env_id: str, skill_name: str, skill_content: str):
     if not env_id or not api_key:
-        return False, "Chưa có sandbox"
+        return False, "Chưa có sandbox hoặc API key"
     clean_env = env_id.replace("environments/", "").strip()
     remote_path = f".agents/skills/{skill_name}/SKILL.md"
-    try:
-        client = genai.Client(api_key=api_key)
-        client.environments.files.upload(
-            environment=clean_env,
-            path=remote_path,
-            file=skill_content.encode("utf-8")
-        )
+    ok, msg = upload_file_to_cloud_sandbox(api_key, clean_env, remote_path, skill_content.encode("utf-8"), "text/markdown")
+    if ok:
         return True, f"Đã đồng bộ `{remote_path}` vào Sandbox Cloud thành công!"
-    except Exception as e:
-        return False, str(e)
+    return False, msg
 
 # --- Bộ xử lý bóc tách các bước tư duy, lệnh thực thi và kết quả công cụ ---
 def format_interaction_steps(interaction):
@@ -428,12 +474,11 @@ def upload_file_to_sandbox(api_key: str, cur_id: str, upload_obj, colab_path_inp
     dest_name = target_name.strip() if target_name and target_name.strip() else source_filename
     clean_env = env_id.replace("environments/", "").strip()
 
-    try:
-        client = genai.Client(api_key=key)
-        client.environments.files.upload(environment=clean_env, path=dest_name, file=data_bytes)
-        return f"✅ **Đã tải tệp lên Sandbox Cloud thành công!**\n- Tên tệp trong Sandbox: `{dest_name}`\n- Dung lượng: **{len(data_bytes):,} bytes**"
-    except Exception as e:
-        return f"❌ Lỗi khi tải tệp lên: {str(e)}"
+    ok, msg = upload_file_to_cloud_sandbox(key, clean_env, dest_name, data_bytes)
+    if ok:
+        return f"✅ **Đã tải tệp lên Sandbox Cloud thành công!**\n- Tên tệp trong Sandbox: `{dest_name}`\n- Dung lượng: **{len(data_bytes):,} bytes**\n- Sandbox ID: `{clean_env}`"
+    else:
+        return f"❌ Lỗi khi tải tệp lên Sandbox: {msg}"
 
 # --- Quản lý & Kết nối Sandbox Cloud Google (Quay lại Sandbox cũ / Xóa chọn lọc / Kiểm tra trạng thái) ---
 def get_all_cloud_sandboxes(api_key: str):
@@ -614,6 +659,29 @@ def clean_all_cloud_sandboxes(api_key: str, sessions):
         return sessions, gr.update(), gr.update(), f"❌ Lỗi khi dọn dẹp: {str(e)}", gr.update()
 
 # --- Quản lý Lưu trữ / Phục hồi Phiên làm việc (Session Persistence) ---
+def get_session_choices(sessions):
+    """Trả về danh sách tuple (Display Name, Session ID) để Dropdown hiển thị tên nhưng binding theo ID duy nhất"""
+    if not isinstance(sessions, dict) or not sessions:
+        return []
+    return [(s_data.get("name", f"Phiên {s_id[:4]}"), s_id) for s_id, s_data in sessions.items()]
+
+def get_next_session_name(sessions):
+    """Tự động tính số thứ tự phiên lớn nhất để không bao giờ bị trùng tên khi tạo phiên mới"""
+    max_num = 0
+    if isinstance(sessions, dict):
+        for s_data in sessions.values():
+            name = s_data.get("name", "")
+            m = re.search(r"Phiên #(\d+)", name)
+            if m:
+                try:
+                    num = int(m.group(1))
+                    if num > max_num:
+                        max_num = num
+                except ValueError:
+                    pass
+    next_num = max(max_num + 1, len(sessions) + 1 if isinstance(sessions, dict) else 1)
+    return f"Phiên #{next_num}"
+
 def init_sessions():
     first_id = uuid.uuid4().hex
     return {first_id: {"name": "Phiên #1 (Mặc định)", "history": [], "system_prompt": "", "skills": {}, "env_id": None}}, first_id
@@ -645,7 +713,7 @@ def load_sessions_backup():
         if not data or not isinstance(data, dict):
             return None, None, None, "⚠️ File sao lưu không hợp lệ."
         first_id = list(data.keys())[0]
-        choices = [s.get("name", "Phiên") for s in data.values()]
+        choices = get_session_choices(data)
         return data, first_id, choices, f"✅ **Đã khôi phục thành công {len(data)} phiên làm việc từ file sao lưu!**"
     except Exception as e:
         return None, None, None, f"❌ Lỗi đọc file: {str(e)}"
@@ -697,8 +765,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             gr.Markdown("### 🗂️ Quản lý phiên hội thoại")
             session_dropdown = gr.Dropdown(
                 label="Chọn phiên làm việc",
-                choices=["Phiên #1 (Mặc định)"],
-                value="Phiên #1 (Mặc định)",
+                choices=get_session_choices(init_dict),
+                value=init_id,
                 interactive=True
             )
             with gr.Row():
@@ -985,67 +1053,160 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
     )
 
     # --- Xử lý các sự kiện Phiên làm việc ---
-    def on_new_session(sessions, cur_id):
+    def on_new_session(sessions, cur_id, current_sys_prompt=""):
+        if not isinstance(sessions, dict) or not sessions:
+            sessions, cur_id = init_sessions()
+
+        # Lưu system prompt của phiên hiện tại trước khi tạo phiên mới
+        if cur_id in sessions and current_sys_prompt is not None:
+            sessions[cur_id]["system_prompt"] = current_sys_prompt
+
         new_id = uuid.uuid4().hex
-        name = f"Phiên #{len(sessions) + 1}"
-        sessions[new_id] = {"name": name, "history": [], "system_prompt": "", "skills": {}, "env_id": None}
-        choices = [s["name"] for s in sessions.values()]
+        name = get_next_session_name(sessions)
+        sessions[new_id] = {
+            "name": name,
+            "history": [],
+            "system_prompt": "",
+            "skills": {},
+            "env_id": None
+        }
+        choices = get_session_choices(sessions)
         return (
-            sessions, new_id, gr.update(choices=choices, value=name),
-            f"### 💬 Trò chuyện: {name}", "ℹ️ *Phiên mới: Chưa có Sandbox ID*",
-            [], "", "*(Chưa kích hoạt Kỹ năng nào trong phiên này)*", gr.update(choices=[], value=None),
+            sessions,
+            new_id,
+            gr.update(choices=choices, value=new_id),
+            f"### 💬 Trò chuyện: {name}",
+            "ℹ️ *Phiên mới: Chưa có Sandbox ID*",
+            [],
+            "",
+            "*(Chưa kích hoạt Kỹ năng nào trong phiên này)*",
+            gr.update(choices=[], value=None),
             "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
         )
 
-    def on_switch_session(selected_name, sessions, cur_id):
-        for s_id, s_data in sessions.items():
-            if s_data["name"] == selected_name:
-                active_env = get_current_env_id(s_id, sessions)
-                env_txt = f"🌐 **Sandbox ID:** `{active_env}`" if active_env else "ℹ️ *Chưa có Sandbox ID (sẽ tự tạo hoặc bấm kết nối ở cột trái)*"
-                sb_badge = f"🌐 **Sandbox hiện tại:** `{active_env}`" if active_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
-                sys_prompt = s_data.get("system_prompt", "")
-                skills_dict = s_data.get("skills", {})
-                skills_md = render_active_skills_markdown(skills_dict)
-                skill_choices = list(skills_dict.keys())
-                return s_id, f"### 💬 Trò chuyện: {selected_name}", env_txt, s_data["history"], sys_prompt, skills_md, gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None), sb_badge
-        return cur_id, f"### 💬 Trò chuyện: {selected_name}", "", [], "", "", gr.update(choices=[]), "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
+    def on_switch_session(selected_id, sessions, cur_id, current_sys_prompt=""):
+        if not isinstance(sessions, dict) or not sessions:
+            sessions, init_id = init_sessions()
+            selected_id = init_id
+            cur_id = init_id
+
+        # Lưu system prompt của phiên hiện tại trước khi chuyển đổi
+        if cur_id in sessions and current_sys_prompt is not None:
+            sessions[cur_id]["system_prompt"] = current_sys_prompt
+
+        # Hỗ trợ tìm kiếm theo tên nếu là chuỗi legacy
+        if selected_id not in sessions:
+            for s_id, s_data in sessions.items():
+                if s_data.get("name") == selected_id:
+                    selected_id = s_id
+                    break
+
+        # Nếu vẫn không tìm thấy, an toàn giữ nguyên phiên hiện tại, tuyệt đối không trả về rỗng []
+        if selected_id not in sessions:
+            selected_id = cur_id if cur_id in sessions else list(sessions.keys())[0]
+
+        s_data = sessions[selected_id]
+        sess_name = s_data.get("name", "Phiên làm việc")
+        active_env = get_current_env_id(selected_id, sessions)
+        env_txt = f"🌐 **Sandbox ID:** `{active_env}`" if active_env else "ℹ️ *Chưa có Sandbox ID (sẽ tự tạo hoặc bấm kết nối ở cột trái)*"
+        sb_badge = f"🌐 **Sandbox hiện tại:** `{active_env}`" if active_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
+        sys_prompt = s_data.get("system_prompt", "")
+        skills_dict = s_data.get("skills", {})
+        skills_md = render_active_skills_markdown(skills_dict)
+        skill_choices = list(skills_dict.keys())
+        return (
+            sessions,
+            selected_id,
+            f"### 💬 Trò chuyện: {sess_name}",
+            env_txt,
+            s_data.get("history", []),
+            sys_prompt,
+            skills_md,
+            gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None),
+            sb_badge
+        )
 
     def on_delete_session(sessions, cur_id):
         if cur_id in active_sessions_agents:
             del active_sessions_agents[cur_id]
+
+        if not isinstance(sessions, dict) or not sessions:
+            sessions, first_id = init_sessions()
+            choices = get_session_choices(sessions)
+            return (
+                sessions,
+                first_id,
+                gr.update(choices=choices, value=first_id),
+                f"### 💬 Trò chuyện: {sessions[first_id]['name']}",
+                "ℹ️ *Chưa có Sandbox ID*",
+                [],
+                "",
+                "*(Chưa kích hoạt Kỹ năng nào trong phiên này)*",
+                gr.update(choices=[], value=None),
+                "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
+            )
+
         if len(sessions) <= 1:
             first_id = list(sessions.keys())[0]
             sessions[first_id]["history"] = []
             sessions[first_id]["skills"] = {}
             sessions[first_id]["env_id"] = None
+            sessions[first_id]["system_prompt"] = ""
+            choices = get_session_choices(sessions)
+            sess_name = sessions[first_id].get("name", "Phiên #1")
             return (
-                sessions, first_id, gr.update(choices=[sessions[first_id]["name"]], value=sessions[first_id]["name"]),
-                f"### 💬 Trò chuyện: {sessions[first_id]['name']}", "ℹ️ *Chưa có Sandbox ID*", [],
-                "*(Chưa kích hoạt Kỹ năng nào trong phiên này)*", gr.update(choices=[]), "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
+                sessions,
+                first_id,
+                gr.update(choices=choices, value=first_id),
+                f"### 💬 Trò chuyện: {sess_name}",
+                "ℹ️ *Chưa có Sandbox ID*",
+                [],
+                "",
+                "*(Chưa kích hoạt Kỹ năng nào trong phiên này)*",
+                gr.update(choices=[], value=None),
+                "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
             )
-        del sessions[cur_id]
+
+        if cur_id in sessions:
+            del sessions[cur_id]
         new_cur_id = list(sessions.keys())[0]
-        name = sessions[new_cur_id]["name"]
-        choices = [s["name"] for s in sessions.values()]
-        skills_dict = sessions[new_cur_id].get("skills", {})
+        choices = get_session_choices(sessions)
+        s_data = sessions[new_cur_id]
+        name = s_data.get("name", "Phiên làm việc")
+        skills_dict = s_data.get("skills", {})
         skills_md = render_active_skills_markdown(skills_dict)
         skill_choices = list(skills_dict.keys())
         active_env = get_current_env_id(new_cur_id, sessions)
         env_txt = f"🌐 **Sandbox ID:** `{active_env}`" if active_env else "ℹ️ *Chưa có Sandbox ID*"
         sb_badge = f"🌐 **Sandbox hiện tại:** `{active_env}`" if active_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
-        return sessions, new_cur_id, gr.update(choices=choices, value=name), f"### 💬 Trò chuyện: {name}", env_txt, sessions[new_cur_id]["history"], skills_md, gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None), sb_badge
+        sys_prompt = s_data.get("system_prompt", "")
+        return (
+            sessions,
+            new_cur_id,
+            gr.update(choices=choices, value=new_cur_id),
+            f"### 💬 Trò chuyện: {name}",
+            env_txt,
+            s_data.get("history", []),
+            sys_prompt,
+            skills_md,
+            gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None),
+            sb_badge
+        )
 
     new_session_btn.click(
-        on_new_session, [sessions_state, current_session_id],
-        [sessions_state, current_session_id, session_dropdown, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
+        on_new_session,
+        inputs=[sessions_state, current_session_id, system_instruction_input],
+        outputs=[sessions_state, current_session_id, session_dropdown, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
     )
     session_dropdown.change(
-        on_switch_session, [session_dropdown, sessions_state, current_session_id],
-        [current_session_id, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
+        on_switch_session,
+        inputs=[session_dropdown, sessions_state, current_session_id, system_instruction_input],
+        outputs=[sessions_state, current_session_id, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
     )
     delete_session_btn.click(
-        on_delete_session, [sessions_state, current_session_id],
-        [sessions_state, current_session_id, session_dropdown, session_title_md, session_env_info, chatbot, active_skills_display, remove_skill_dropdown, current_sandbox_display]
+        on_delete_session,
+        inputs=[sessions_state, current_session_id],
+        outputs=[sessions_state, current_session_id, session_dropdown, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
     )
 
     # File Explorer Events
@@ -1076,25 +1237,58 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
     def handle_load_backup(sessions, cur_id):
         loaded_data, first_id, choices, msg = load_sessions_backup()
         if not loaded_data:
-            return sessions, cur_id, gr.update(), msg, [], "*(Chưa kích hoạt Kỹ năng nào)*", gr.update()
-        first_skills = loaded_data[first_id].get("skills", {})
+            return (
+                sessions, cur_id, gr.update(), msg, gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            )
+        first_s = loaded_data[first_id]
+        first_name = first_s.get("name", "Phiên #1")
+        first_skills = first_s.get("skills", {})
         skills_md = render_active_skills_markdown(first_skills)
         skill_choices = list(first_skills.keys())
-        return loaded_data, first_id, gr.update(choices=choices, value=choices[0]), msg, loaded_data[first_id]["history"], skills_md, gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None)
+        first_env = first_s.get("env_id")
+        env_txt = f"🌐 **Sandbox ID:** `{first_env}`" if first_env else "ℹ️ *Chưa có Sandbox ID*"
+        sb_badge = f"🌐 **Sandbox hiện tại:** `{first_env}`" if first_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
+        first_prompt = first_s.get("system_prompt", "")
+        return (
+            loaded_data,
+            first_id,
+            gr.update(choices=choices, value=first_id),
+            msg,
+            first_s.get("history", []),
+            first_prompt,
+            skills_md,
+            gr.update(choices=skill_choices, value=skill_choices[0] if skill_choices else None),
+            f"### 💬 Trò chuyện: {first_name}",
+            env_txt,
+            sb_badge
+        )
 
     def handle_export_markdown(sessions, cur_id):
         return export_session_markdown(sessions, cur_id)
 
+    def handle_clear_chat(sessions, cur_id):
+        if not isinstance(sessions, dict):
+            sessions, cur_id = init_sessions()
+        if cur_id in sessions:
+            sessions[cur_id]["history"] = []
+        return sessions, []
+
     # Persistence Events
     save_backup_btn.click(handle_save_backup, inputs=[sessions_state], outputs=[backup_status])
     load_backup_btn.click(
-        handle_load_backup, inputs=[sessions_state, current_session_id],
-        outputs=[sessions_state, current_session_id, session_dropdown, backup_status, chatbot, active_skills_display, remove_skill_dropdown]
+        handle_load_backup,
+        inputs=[sessions_state, current_session_id],
+        outputs=[sessions_state, current_session_id, session_dropdown, backup_status, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, session_title_md, session_env_info, current_sandbox_display]
     )
     export_md_btn.click(handle_export_markdown, inputs=[sessions_state, current_session_id], outputs=[backup_status])
 
     # Clear chat
-    clear_btn.click(lambda sess, cid: (sess, {**sess, cid: {**sess[cid], 'history': []}}[cid]['history']), [sessions_state, current_session_id], [sessions_state, chatbot])
+    clear_btn.click(
+        handle_clear_chat,
+        inputs=[sessions_state, current_session_id],
+        outputs=[sessions_state, chatbot]
+    )
 
     # --- Xử lý tin nhắn & Đính kèm TẤT CẢ các loại tệp (Ảnh, PDF, CSV, Code, ZIP, TXT...) ---
     def user_msg(user_message, history, sessions, cur_id):
@@ -1205,14 +1399,14 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             file_notices.append(f"- `{pf['filename']}` ({pf['size']:,} bytes)")
             extra_sources.append({
                 "type": "inline",
-                "target": pf["filename"],
+                "target": f"workspace/{pf['filename']}",
                 "content": pf["data"],
                 "encoding": "base64"
             })
 
         effective_prompt_text = pending_text
         if file_notices:
-            attached_summary = "📁 **[Các tệp đã được đính kèm vào thư mục Sandbox hiện tại]:**\n" + "\n".join(file_notices) + "\n\n"
+            attached_summary = "📁 **[Các tệp đã được tải lên và đính kèm vào Sandbox (`/workspace/`)]:**\n" + "\n".join(file_notices) + "\n\n"
             effective_prompt_text = attached_summary + (pending_text or "Hãy xem các tệp đính kèm trên và giúp tôi xử lý theo yêu cầu.")
 
         # Xây dựng input cho Google GenAI Interactions API (Hỗ trợ Multimodal Text + Images)
@@ -1258,24 +1452,23 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
             agent_sess = active_sessions_agents[cur_id]
 
-            # Nếu Sandbox đã đang chạy và có tệp mới, đẩy trực tiếp tệp vào Sandbox
+            # Nếu Sandbox đã đang chạy và có tệp mới, đẩy trực tiếp tệp vào Sandbox qua cơ chế 2 lớp bền bỉ
             if agent_sess.env_id and pending_files:
-                client_temp = genai.Client(api_key=active_key)
                 for pf in pending_files:
-                    try:
-                        client_temp.environments.files.upload(
-                            environment=agent_sess.env_id,
-                            path=pf["filename"],
-                            file=pf["bytes"]
-                        )
-                    except Exception:
-                        pass
+                    ok_up, _ = upload_file_to_cloud_sandbox(active_key, agent_sess.env_id, f"workspace/{pf['filename']}", pf["bytes"], pf.get("mime"))
+                    if not ok_up:
+                        upload_file_to_cloud_sandbox(active_key, agent_sess.env_id, pf["filename"], pf["bytes"], pf.get("mime"))
 
             # Gửi yêu cầu tới Agent (Hỗ trợ Self-Healing tự tạo Sandbox mới nếu Sandbox cũ bị 404/Expired)
             interaction = agent_sess.ask(agent_input, system_instruction=sys_prompt, skills=current_skills, extra_sources=extra_sources)
 
             # Cập nhật Sandbox ID thực tế sau khi thực thi
             sessions[cur_id]["env_id"] = agent_sess.env_id
+
+            # Đảm bảo các tệp đính kèm cũng được ghi nhận vào Sandbox nếu vừa được cấp phát mới
+            if agent_sess.env_id and pending_files:
+                for pf in pending_files:
+                    upload_file_to_cloud_sandbox(active_key, agent_sess.env_id, f"workspace/{pf['filename']}", pf["bytes"], pf.get("mime"))
 
             steps_markdown = format_interaction_steps(interaction)
             final_output = interaction.output_text or "*(Đã hoàn thành tác vụ)*"
