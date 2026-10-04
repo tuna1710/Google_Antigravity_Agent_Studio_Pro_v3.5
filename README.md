@@ -1,6 +1,6 @@
 # 🛸 Google Antigravity Managed Agent Studio Pro (v3.6)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)]([https://colab.research.google.com/drive/16em1reTK7wKrRIxBRtGwREgwbtRWwBRQ?usp=sharing](https://colab.research.google.com/github/tuna1710/Google_Antigravity_Agent_Studio_Pro_v3.5/blob/main/notebooks/antigravity_studio_pro_v36.ipynb))
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/tuna1710/Google_Antigravity_Agent_Studio_Pro_v3.5/blob/main/notebooks/antigravity_studio_pro_v36.ipynb)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
