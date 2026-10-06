@@ -8,6 +8,11 @@ Compatible with Local environment, Docker, Google Colab, and Cloud Run/VPS.
 import os
 import sys
 
+# Sửa lỗi proxy nếu có trong môi trường sandbox/container/Colab trước khi nạp thư viện mạng
+for k in ["no_proxy", "NO_PROXY", "GLOBAL_AGENT_NO_PROXY"]:
+    if k in os.environ and ("[::1]" in os.environ[k] or "::1" in os.environ[k]):
+        os.environ[k] = "localhost,127.0.0.1"
+
 # Tự động nạp biến môi trường từ file .env nếu có
 try:
     from dotenv import load_dotenv
@@ -15,9 +20,6 @@ try:
 except ImportError:
     pass
 
-# @title
-import os
-import sys
 import json
 import re
 import time
@@ -28,11 +30,6 @@ import base64
 import mimetypes
 import requests
 import gradio as gr
-
-# Sửa lỗi proxy nếu có trong môi trường sandbox/container
-for k in ["no_proxy", "NO_PROXY", "GLOBAL_AGENT_NO_PROXY"]:
-    if k in os.environ and ("[::1]" in os.environ[k] or "::1" in os.environ[k]):
-        os.environ[k] = "localhost,127.0.0.1"
 
 from google import genai
 from google.genai import types
