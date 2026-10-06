@@ -61,8 +61,9 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 os.makedirs(COLAB_DOWNLOAD_DIR, exist_ok=True)
 BACKUP_FILE = os.path.join(BACKUP_DIR, "agent_sessions_backup.json")
 
-DEFAULT_AGENT = "antigravity-preview-05-2026"
+DEFAULT_AGENT = "antigravity-preview-09-2026"
 AVAILABLE_AGENTS = [
+    "antigravity-preview-09-2026",
     "antigravity-preview-05-2026",
     "deep-research-preview-04-2026",
     "deep-research-max-preview-04-2026",
@@ -142,14 +143,14 @@ description: Rà soát bảo mật mã nguồn, phát hiện API key bị lộ, 
 
 # --- Class quản lý phiên tương tác với Antigravity Agent, Skills & Tự động phục hồi Sandbox ---
 class ManagedAgentSession:
-    def __init__(self, api_key: str, agent: str = DEFAULT_AGENT, system_instruction: str = "", skills: dict = None, env_id: str = None):
+    def __init__(self, api_key: str, agent: str = DEFAULT_AGENT, system_instruction: str = "", skills: dict = None, env_id: str = None, last_interaction_id: str = None):
         self.api_key = api_key
         self.agent = agent
         self.system_instruction = system_instruction.strip() if system_instruction else ""
         self.skills = skills.copy() if skills else {}
         self.client = genai.Client(api_key=api_key)
         self.env_id = env_id.replace("environments/", "").strip() if env_id else None
-        self.last_interaction_id = None
+        self.last_interaction_id = last_interaction_id
         self.step = 0
         self.auto_recreated = False
         self.old_expired_id = None
@@ -696,8 +697,19 @@ def get_next_session_name(sessions):
     return f"Phiên #{next_num}"
 
 def init_sessions():
+    # Tự động nạp dữ liệu từ file sao lưu nếu đã tồn tại trên máy hoặc Google Drive
+    if os.path.exists(BACKUP_FILE):
+        try:
+            with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data and isinstance(data, dict):
+                first_id = list(data.keys())[0]
+                return data, first_id
+        except Exception as e:
+            print(f"[Init Warning] Không thể tự động nạp backup: {e}")
+
     first_id = uuid.uuid4().hex
-    return {first_id: {"name": "Phiên #1 (Mặc định)", "history": [], "system_prompt": "", "skills": {}, "env_id": None}}, first_id
+    return {first_id: {"name": "Phiên #1 (Mặc định)", "history": [], "system_prompt": "", "skills": {}, "env_id": None, "last_interaction_id": None}}, first_id
 
 def render_active_skills_markdown(skills_dict):
     if not skills_dict:
@@ -789,7 +801,9 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
             # Mục 1: Hộp công cụ Sandbox & Tệp tin Cloud (Gom Sandbox + File Explorer)
             with gr.Accordion("📦 Quản lý Sandbox & Tệp tin Cloud (Sandbox & Files)", open=True):
-                current_sandbox_display = gr.Markdown("🌐 **Sandbox hiện tại:** *(Chưa kết nối - sẽ tự cấp phát khi gửi tin nhắn)*")
+                init_active_env = init_dict.get(init_id, {}).get("env_id")
+                init_sb_badge = f"🌐 **Sandbox hiện tại:** `{init_active_env}`" if init_active_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối - sẽ tự cấp phát khi gửi tin nhắn)*"
+                current_sandbox_display = gr.Markdown(init_sb_badge)
 
                 with gr.Tab("📁 Tệp tin Sandbox (File Explorer)"):
                     gr.Markdown("Duyệt và tải tệp từ Cloud Sandbox về thư mục `/content/` của Colab:")
@@ -831,7 +845,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             # Mục 2: Quản lý Kỹ năng (Agent Skills)
             with gr.Accordion("🧩 Quản lý Kỹ năng (Agent Skills)", open=False):
                 gr.Markdown("Kỹ năng cung cấp quy trình chuyên sâu cho Agent (`.agents/skills/`):")
-                active_skills_display = gr.Markdown("*(Chưa kích hoạt Kỹ năng nào trong phiên này)*")
+                init_skills = init_dict.get(init_id, {}).get("skills", {})
+                active_skills_display = gr.Markdown(render_active_skills_markdown(init_skills))
 
                 with gr.Tab("Thư viện Mẫu"):
                     skill_sample_dropdown = gr.Dropdown(
@@ -860,7 +875,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                     add_registry_skill_btn = gr.Button("🔗 Gắn từ Registry", size="sm")
 
                 with gr.Row():
-                    remove_skill_dropdown = gr.Dropdown(label="Chọn Skill để gỡ", choices=[])
+                    init_skill_choices = list(init_skills.keys())
+                    remove_skill_dropdown = gr.Dropdown(label="Chọn Skill để gỡ", choices=init_skill_choices, value=init_skill_choices[0] if init_skill_choices else None)
                     remove_skill_btn = gr.Button("🗑️ Gỡ bỏ", size="sm")
 
                 skill_action_status = gr.Markdown("")
@@ -884,9 +900,11 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                     placeholder="Nhập mã model hoặc agent...",
                     visible=False
                 )
+                init_sys_prompt = init_dict.get(init_id, {}).get("system_prompt", "")
                 system_instruction_input = gr.Textbox(
                     label="Chỉ dẫn hệ thống (System Instruction)",
                     placeholder="Ví dụ: Bạn là một lập trình viên Fullstack hàng đầu, hãy ưu tiên viết mã hoàn chỉnh và giải thích ngắn gọn...",
+                    value=init_sys_prompt,
                     lines=3
                 )
 
@@ -902,9 +920,11 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
         # --- CỘT CHAT BÊN PHẢI ---
         with gr.Column(scale=3):
-            session_title_md = gr.Markdown("### 💬 Trò chuyện: Phiên #1 (Mặc định)")
-            session_env_info = gr.Markdown("ℹ️ *Chưa có Sandbox ID (sẽ tự động cấp phát khi gửi tin nhắn đầu tiên hoặc bấm kết nối ở cột trái)*")
-            chatbot = gr.Chatbot(height=520, show_label=False)
+            init_sess_name = init_dict.get(init_id, {}).get("name", "Phiên #1 (Mặc định)")
+            init_env_txt = f"🌐 **Sandbox ID:** `{init_active_env}`" if init_active_env else "ℹ️ *Chưa có Sandbox ID (sẽ tự động cấp phát khi gửi tin nhắn đầu tiên hoặc bấm kết nối ở cột trái)*"
+            session_title_md = gr.Markdown(f"### 💬 Trò chuyện: {init_sess_name}")
+            session_env_info = gr.Markdown(init_env_txt)
+            chatbot = gr.Chatbot(value=init_dict.get(init_id, {}).get("history", []), height=520, show_label=False)
             msg_input = gr.MultimodalTextbox(
                 placeholder="Nhập câu hỏi, dán ảnh (Ctrl+V) hoặc bấm biểu tượng đính kèm để gửi bất kỳ tệp nào (PDF, CSV, Excel, Code, ZIP, TXT...)...",
                 file_count="multiple",
@@ -1082,8 +1102,13 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             "history": [],
             "system_prompt": "",
             "skills": {},
-            "env_id": None
+            "env_id": None,
+            "last_interaction_id": None
         }
+        try:
+            save_sessions_backup(sessions)
+        except Exception:
+            pass
         choices = get_session_choices(sessions)
         return (
             sessions,
@@ -1183,6 +1208,10 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
         if cur_id in sessions:
             del sessions[cur_id]
+        try:
+            save_sessions_backup(sessions)
+        except Exception:
+            pass
         new_cur_id = list(sessions.keys())[0]
         choices = get_session_choices(sessions)
         s_data = sessions[new_cur_id]
@@ -1461,16 +1490,21 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
         try:
             existing_env = sessions[cur_id].get("env_id")
+            existing_last_interaction = sessions[cur_id].get("last_interaction_id")
             if cur_id not in active_sessions_agents or active_sessions_agents[cur_id].api_key != active_key or active_sessions_agents[cur_id].agent != chosen_agent:
                 active_sessions_agents[cur_id] = ManagedAgentSession(
                     api_key=active_key,
                     agent=chosen_agent,
                     system_instruction=sys_prompt,
                     skills=current_skills,
-                    env_id=existing_env
+                    env_id=existing_env,
+                    last_interaction_id=existing_last_interaction
                 )
-            elif existing_env and active_sessions_agents[cur_id].env_id != existing_env:
-                active_sessions_agents[cur_id].env_id = existing_env
+            else:
+                if existing_env and active_sessions_agents[cur_id].env_id != existing_env:
+                    active_sessions_agents[cur_id].env_id = existing_env
+                if existing_last_interaction and not active_sessions_agents[cur_id].last_interaction_id:
+                    active_sessions_agents[cur_id].last_interaction_id = existing_last_interaction
 
             agent_sess = active_sessions_agents[cur_id]
 
@@ -1484,8 +1518,9 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             # Gửi yêu cầu tới Agent (Hỗ trợ Self-Healing tự tạo Sandbox mới nếu Sandbox cũ bị 404/Expired)
             interaction = agent_sess.ask(agent_input, system_instruction=sys_prompt, skills=current_skills, extra_sources=extra_sources)
 
-            # Cập nhật Sandbox ID thực tế sau khi thực thi
+            # Cập nhật Sandbox ID và Interaction ID thực tế sau khi thực thi
             sessions[cur_id]["env_id"] = agent_sess.env_id
+            sessions[cur_id]["last_interaction_id"] = agent_sess.last_interaction_id
 
             # Đảm bảo các tệp đính kèm cũng được ghi nhận vào Sandbox nếu vừa được cấp phát mới
             if agent_sess.env_id and pending_files:
@@ -1510,6 +1545,12 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             history[-1]["content"] = final_reply
             history[-1]["time"] = finish_time_str
             sessions[cur_id]["history"] = history
+
+            # Tự động sao lưu phiên làm việc xuống đĩa sau mỗi lượt chat (Auto-Persistence)
+            try:
+                save_sessions_backup(sessions)
+            except Exception:
+                pass
 
             env_info = f"🌐 **Sandbox ID:** `{agent_sess.env_id}` (Lượt #{agent_sess.step} | Agent: `{chosen_agent}` | Skills: {len(current_skills)})"
             sb_badge = f"🌐 **Sandbox hiện tại:** `{agent_sess.env_id}`"

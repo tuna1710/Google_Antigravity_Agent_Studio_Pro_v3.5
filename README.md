@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Giao diện Studio toàn diện và mạnh mẽ được xây dựng bằng **Gradio** để tương tác với **Google Managed Antigravity Agent** (`antigravity-preview-05-2026`) thông qua **Google GenAI Interactions API**.
+Giao diện Studio toàn diện và mạnh mẽ được xây dựng bằng **Gradio** để tương tác với **Google Managed Antigravity Agent** (`antigravity-preview-09-2026` & `antigravity-preview-05-2026`) thông qua **Google GenAI Interactions API**.
 
 ---
 
@@ -23,6 +23,9 @@ Giao diện Studio toàn diện và mạnh mẽ được xây dựng bằng **Gr
 4. **📎 Hỗ Trợ Đa Phương Tiện Toàn Diện**:
    - Đính kèm tệp linh hoạt: Ảnh, PDF, CSV, Excel, TXT, JSON, Code, ZIP,...
    - Hỗ trợ dán trực tiếp ảnh từ clipboard (`Ctrl + V`).
+5. **🧠 Quản Lý Ngữ Cảnh Bền Vững & Tự Động Phục Hồi (Auto-Persistence)**:
+   - Tự động duy trì và khôi phục `previous_interaction_id` giúp Agent nhớ toàn vẹn ngữ cảnh hội thoại xuyên suốt các phiên mà không bị mất khi tắt app.
+   - Tự động sao lưu lịch sử làm việc xuống đĩa sau mỗi lượt chat và tự động nạp lại khi khởi động.
 
 ---
 
