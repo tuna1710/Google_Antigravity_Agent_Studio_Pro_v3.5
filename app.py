@@ -138,7 +138,7 @@ description: Rà soát bảo mật mã nguồn, phát hiện API key bị lộ, 
     }
 }
 
-# --- Class quản lý phiên tương tác với Antigravity Agent, Skills & Tự động phục hồi Sandbox ---
+# --- Class quản lý phiên tương tác với Antigravity Agent, Skills & Tự động phục hồi Sandbox (Hỗ trợ Background Execution) ---
 class ManagedAgentSession:
     def __init__(self, api_key: str, agent: str = DEFAULT_AGENT, system_instruction: str = "", skills: dict = None, env_id: str = None, last_interaction_id: str = None):
         self.api_key = api_key
@@ -148,18 +148,30 @@ class ManagedAgentSession:
         self.client = genai.Client(api_key=api_key)
         self.env_id = env_id.replace("environments/", "").strip() if env_id else None
         self.last_interaction_id = last_interaction_id
+        self.running_interaction_id = None
+        self.cancel_requested = False
         self.step = 0
         self.auto_recreated = False
         self.old_expired_id = None
 
-    def ask(self, prompt, system_instruction: str = None, skills: dict = None, extra_sources: list = None):
+    def ask(self, prompt, system_instruction: str = None, skills: dict = None, extra_sources: list = None, background: bool = False, wait_until_complete: bool = False, poll_interval: float = 2.0, timeout: float = 300.0, poll_callback = None):
+        """
+        Gửi yêu cầu tới Agent.
+        - background=True: Kích hoạt chế độ Background Execution bất đồng bộ trên Google Cloud.
+        - wait_until_complete=True: Tự động poll định kỳ cho đến khi hoàn thành (an toàn chống HTTP timeout).
+        - wait_until_complete=False (khi background=True): Trả về ngay đối tượng Interaction ban đầu (status: 'in_progress').
+        """
         self.step += 1
         self.auto_recreated = False
         self.old_expired_id = None
+        self.cancel_requested = False
         kwargs = {"agent": self.agent, "input": prompt}
         sys_inst = system_instruction if system_instruction is not None else self.system_instruction
         if sys_inst and sys_inst.strip():
             kwargs["system_instruction"] = sys_inst.strip()
+
+        if background:
+            kwargs["background"] = True
 
         active_skills = skills if skills is not None else self.skills
 
@@ -201,11 +213,20 @@ class ManagedAgentSession:
             if self.last_interaction_id:
                 kwargs["previous_interaction_id"] = self.last_interaction_id
 
+        def _record_interaction(inter):
+            if inter:
+                self.env_id = getattr(inter, "environment_id", None) or clean_id
+                inter_id = getattr(inter, "id", None)
+                if inter_id:
+                    self.last_interaction_id = inter_id
+                if getattr(inter, "status", None) == "in_progress":
+                    self.running_interaction_id = self.last_interaction_id
+                else:
+                    self.running_interaction_id = None
+
         try:
             interaction = self.client.interactions.create(**kwargs)
-            self.env_id = interaction.environment_id or clean_id
-            self.last_interaction_id = interaction.id
-            return interaction
+            _record_interaction(interaction)
         except Exception as e:
             err_msg = str(e)
             # Tự động khắc phục lỗi 404 nếu Sandbox cũ bị hết hạn (Expired) hoặc bị xóa trên Google Cloud
@@ -222,13 +243,108 @@ class ManagedAgentSession:
                 else:
                     kwargs["environment"] = "remote"
 
+                if background:
+                    kwargs["background"] = True
+
                 # Thử lại ngay lập tức với Sandbox mới
                 interaction = self.client.interactions.create(**kwargs)
-                self.env_id = interaction.environment_id
-                self.last_interaction_id = interaction.id
-                return interaction
+                _record_interaction(interaction)
             else:
                 raise e
+
+        # Nếu kích hoạt background và yêu cầu tự động đợi qua polling
+        if background and wait_until_complete and self.running_interaction_id:
+            interaction = self.poll_until_complete(
+                interaction_id=self.running_interaction_id,
+                poll_interval=poll_interval,
+                timeout=timeout,
+                callback=poll_callback
+            )
+
+        return interaction
+
+    def get_interaction(self, interaction_id: str = None):
+        """
+        Lấy thông tin và trạng thái hiện tại của Interaction từ Google Cloud (GET /interactions/{id}).
+        """
+        target_id = interaction_id or self.running_interaction_id or self.last_interaction_id
+        if not target_id:
+            return None
+        clean_id = target_id.replace("interactions/", "").strip()
+        inter = self.client.interactions.get(id=clean_id)
+        if getattr(inter, "environment_id", None):
+            self.env_id = inter.environment_id
+        if getattr(inter, "status", None) != "in_progress":
+            if self.running_interaction_id == clean_id:
+                self.running_interaction_id = None
+            self.last_interaction_id = getattr(inter, "id", None) or clean_id
+        return inter
+
+    def cancel_interaction(self, interaction_id: str = None):
+        """
+        Hủy một tác vụ đang chạy trên Google Cloud (POST /interactions/{id}/cancel).
+        """
+        self.cancel_requested = True
+        target_id = interaction_id or self.running_interaction_id
+        if not target_id:
+            return False, "Không có tác vụ nào đang chạy để hủy."
+        clean_id = target_id.replace("interactions/", "").strip()
+        try:
+            # 1. Thử qua SDK google-genai
+            res = self.client.interactions.cancel(id=clean_id)
+            self.running_interaction_id = None
+            return True, getattr(res, "status", "cancelled")
+        except Exception as e:
+            # 2. Fallback trực tiếp qua REST API nếu SDK gặp vấn đề mạng
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/interactions/{clean_id}/cancel"
+                headers = {
+                    "x-goog-api-key": self.api_key,
+                    "Content-Type": "application/json",
+                    "Api-Revision": "2026-05-20"
+                }
+                resp = requests.post(url, headers=headers, timeout=10)
+                if resp.status_code in (200, 204):
+                    self.running_interaction_id = None
+                    return True, "cancelled"
+                return False, f"Lỗi HTTP {resp.status_code}: {resp.text}"
+            except Exception as e2:
+                return False, f"Lỗi khi hủy tương tác: {str(e2)}"
+
+    def poll_until_complete(self, interaction_id: str = None, poll_interval: float = 2.0, timeout: float = 300.0, callback = None):
+        """
+        Kiểm tra định kỳ trạng thái của một tương tác nền cho đến khi hoàn thành hoặc timeout.
+        - callback(interaction): Được gọi ở mỗi vòng lặp để cập nhật tiến trình.
+        """
+        target_id = interaction_id or self.running_interaction_id or self.last_interaction_id
+        if not target_id:
+            raise ValueError("Không có interaction ID để thăm dò trạng thái.")
+        clean_id = target_id.replace("interactions/", "").strip()
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            inter = self.get_interaction(clean_id)
+            if callback and callable(callback):
+                callback(inter)
+            status = getattr(inter, "status", None)
+            if status != "in_progress":
+                return inter
+            time.sleep(poll_interval)
+
+        raise TimeoutError(f"Tác vụ {clean_id} vượt quá thời gian chờ ({timeout} giây)")
+
+    def stream_interaction(self, interaction_id: str = None, last_event_id: str = None):
+        """
+        Mở luồng SSE nhận sự kiện tiến trình của interaction với cơ chế phục hồi qua last_event_id.
+        """
+        target_id = interaction_id or self.running_interaction_id or self.last_interaction_id
+        if not target_id:
+            raise ValueError("Không có interaction ID để stream.")
+        clean_id = target_id.replace("interactions/", "").strip()
+        kwargs = {"id": clean_id, "stream": True}
+        if last_event_id:
+            kwargs["last_event_id"] = last_event_id
+        return self.client.interactions.get(**kwargs)
 
 # Lưu trữ phiên làm việc đang chạy (session_id -> ManagedAgentSession)
 active_sessions_agents = {}
@@ -693,6 +809,98 @@ def get_next_session_name(sessions):
     next_num = max(max_num + 1, len(sessions) + 1 if isinstance(sessions, dict) else 1)
     return f"Phiên #{next_num}"
 
+def check_and_recover_running_interaction(s_data: dict, api_key: str = None) -> tuple[dict, str]:
+    """
+    Kiểm tra và đồng bộ trạng thái của một tác vụ đang chạy ngầm (running_interaction_id)
+    khi người dùng quay lại phiên hoặc khôi phục từ file sao lưu.
+    Trả về (s_data đã cập nhật, thông báo trạng thái cập nhật).
+    """
+    if not isinstance(s_data, dict):
+        return s_data, ""
+
+    running_id = s_data.get("running_interaction_id")
+    if not running_id:
+        return s_data, ""
+
+    clean_id = str(running_id).replace("interactions/", "").strip()
+    effective_key = (api_key or "").strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
+    if not effective_key:
+        return s_data, f"⚡ Tác vụ `{clean_id}` đang chạy ngầm (cần API Key để đồng bộ)."
+
+    try:
+        tmp_sess = ManagedAgentSession(
+            api_key=effective_key,
+            agent=DEFAULT_AGENT,
+            env_id=s_data.get("env_id")
+        )
+        inter = tmp_sess.get_interaction(clean_id)
+        if not inter:
+            return s_data, ""
+
+        status = getattr(inter, "status", None)
+        finish_time_str = get_current_time_str()
+
+        if status == "completed":
+            s_data["running_interaction_id"] = None
+            s_data["last_interaction_id"] = clean_id
+            if getattr(inter, "environment_id", None):
+                s_data["env_id"] = inter.environment_id
+
+            steps_markdown = format_interaction_steps(inter)
+            final_output = getattr(inter, "output_text", None) or "*(Đã hoàn thành tác vụ)*"
+            time_footer = (
+                f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 8px; border-top: 1px dashed rgba(128,128,128,0.25); padding-top: 4px;">'
+                f'🕒 <i>Hoàn tất trong chế độ ngầm: {finish_time_str} • Tác vụ: `{clean_id}`</i></div>'
+            )
+            final_reply = f"{steps_markdown}{final_output}{time_footer}" if steps_markdown else f"{final_output}{time_footer}"
+
+            history = s_data.get("history", [])
+            if history and history[-1].get("role") == "assistant" and ("Background Execution" in history[-1].get("content", "") or "Đang xử lý" in history[-1].get("content", "")):
+                history[-1]["content"] = final_reply
+                history[-1]["time"] = finish_time_str
+            else:
+                history.append({"role": "assistant", "content": final_reply, "time": finish_time_str})
+            s_data["history"] = history
+            return s_data, f"✅ Tác vụ ngầm `{clean_id}` đã hoàn thành trên Google Cloud!"
+
+        elif status == "cancelled":
+            s_data["running_interaction_id"] = None
+            history = s_data.get("history", [])
+            if history and history[-1].get("role") == "assistant" and ("Background Execution" in history[-1].get("content", "") or "Đang xử lý" in history[-1].get("content", "")):
+                history[-1]["content"] += f"\n\n🛑 **Tác vụ đã dừng lại trên Cloud (Cancelled).**"
+            s_data["history"] = history
+            return s_data, f"🛑 Tác vụ `{clean_id}` đã bị hủy."
+
+        elif status == "failed":
+            s_data["running_interaction_id"] = None
+            err = getattr(inter, "error", "Không xác định")
+            history = s_data.get("history", [])
+            if history and history[-1].get("role") == "assistant":
+                history[-1]["content"] += f"\n\n❌ **Tác vụ thất bại trên Cloud:** {err}"
+            s_data["history"] = history
+            return s_data, f"❌ Tác vụ `{clean_id}` thất bại: {err}"
+
+        elif status == "in_progress":
+            steps_markdown = format_interaction_steps(inter)
+            history = s_data.get("history", [])
+            if history and history[-1].get("role") == "assistant":
+                progress_card = (
+                    f"⚡ **[Background Execution] Tác vụ vẫn đang tiếp tục xử lý trên Google Cloud**\n"
+                    f"- 🆔 **Interaction ID:** `{clean_id}`\n"
+                    f"- 🌐 **Sandbox ID:** `{s_data.get('env_id') or 'Đang cấp phát...'}`\n"
+                    f"- 🔄 **Trạng thái:** 🟡 *Đang thực thi các bước...*\n\n"
+                )
+                if steps_markdown:
+                    progress_card += f"{steps_markdown}\n"
+                history[-1]["content"] = progress_card
+                s_data["history"] = history
+            return s_data, f"⚡ Tác vụ `{clean_id}` vẫn đang chạy ngầm trên Google Cloud."
+
+    except Exception as e:
+        return s_data, f"⚠️ Lỗi khi đồng bộ tác vụ `{clean_id}`: {e}"
+
+    return s_data, ""
+
 def init_sessions():
     # Tự động nạp dữ liệu từ file sao lưu nếu đã tồn tại trên máy hoặc Google Drive
     if os.path.exists(BACKUP_FILE):
@@ -701,12 +909,17 @@ def init_sessions():
                 data = json.load(f)
             if data and isinstance(data, dict):
                 first_id = list(data.keys())[0]
+                eff_key = colab_api_key or os.environ.get("GEMINI_API_KEY", "")
+                if eff_key:
+                    for sid in list(data.keys()):
+                        if data[sid].get("running_interaction_id"):
+                            data[sid], _ = check_and_recover_running_interaction(data[sid], eff_key)
                 return data, first_id
         except Exception as e:
             print(f"[Init Warning] Không thể tự động nạp backup: {e}")
 
     first_id = uuid.uuid4().hex
-    return {first_id: {"name": "Phiên #1 (Mặc định)", "history": [], "system_prompt": "", "skills": {}, "env_id": None, "last_interaction_id": None}}, first_id
+    return {first_id: {"name": "Phiên #1 (Mặc định)", "history": [], "system_prompt": "", "skills": {}, "env_id": None, "last_interaction_id": None, "running_interaction_id": None}}, first_id
 
 def render_active_skills_markdown(skills_dict):
     if not skills_dict:
@@ -778,7 +991,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
     gr.Markdown("""
     # 🛸 Google Antigravity Managed Agent Studio Pro (v3.5)
-    Sử dụng chính thức **Google Managed Antigravity Engine** (`antigravity-preview-05-2026`) trên Google Cloud.
+    Sử dụng chính thức **Google Managed Antigravity Engine** (`antigravity-preview-09-2026`) trên Google Cloud.
     ✨ **Các tính năng Pro:** Đính kèm tất cả các loại tệp (Ảnh, PDF, CSV, Excel, Code, ZIP...), Dán ảnh trực tiếp (Ctrl+V), Tự động phục hồi khi Sandbox hết hạn (Self-Healing Fallback), Quay trở lại Sandbox cũ, Chọn Sandbox cụ thể để xóa, Quản lý Kỹ năng (Agent Skills & Registry), Quản lý tệp Sandbox 2 chiều (tải về `/content/`).
     """)
 
@@ -904,6 +1117,11 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                     value=init_sys_prompt,
                     lines=3
                 )
+                background_mode_chk = gr.Checkbox(
+                    label="⚡ Chế độ chạy ngầm (Background Execution)",
+                    value=True,
+                    info="Cho phép Agent chạy ngầm trên Google Cloud, tránh timeout 60s và hiển thị tiến trình thời gian thực."
+                )
 
 
 
@@ -929,8 +1147,9 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                 autofocus=True
             )
             with gr.Row():
-                submit_btn = gr.Button("🚀 Gửi yêu cầu", variant="primary")
-                clear_btn = gr.Button("🧹 Xóa tin nhắn trong phiên")
+                submit_btn = gr.Button("🚀 Gửi yêu cầu", variant="primary", scale=3)
+                cancel_btn = gr.Button("🛑 Hủy tác vụ", variant="stop", scale=1)
+                clear_btn = gr.Button("🧹 Xóa tin nhắn trong phiên", scale=1)
 
     # --- Xử lý logic Agent Dropdown tùy chỉnh ---
     def on_agent_select_change(choice):
@@ -1100,7 +1319,8 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             "system_prompt": "",
             "skills": {},
             "env_id": None,
-            "last_interaction_id": None
+            "last_interaction_id": None,
+            "running_interaction_id": None
         }
         try:
             save_sessions_backup(sessions)
@@ -1120,7 +1340,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
         )
 
-    def on_switch_session(selected_id, sessions, cur_id, current_sys_prompt=""):
+    def on_switch_session(selected_id, sessions, cur_id, current_sys_prompt="", api_key=""):
         if not isinstance(sessions, dict) or not sessions:
             sessions, init_id = init_sessions()
             selected_id = init_id
@@ -1142,9 +1362,22 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             selected_id = cur_id if cur_id in sessions else list(sessions.keys())[0]
 
         s_data = sessions[selected_id]
+
+        # Kiểm tra và khôi phục tác vụ nếu phiên này có tác vụ ngầm
+        sync_note = ""
+        if s_data.get("running_interaction_id"):
+            s_data, sync_note = check_and_recover_running_interaction(s_data, api_key)
+            sessions[selected_id] = s_data
+            try:
+                save_sessions_backup(sessions)
+            except Exception:
+                pass
+
         sess_name = s_data.get("name", "Phiên làm việc")
         active_env = get_current_env_id(selected_id, sessions)
         env_txt = f"🌐 **Sandbox ID:** `{active_env}`" if active_env else "ℹ️ *Chưa có Sandbox ID (sẽ tự tạo hoặc bấm kết nối ở cột trái)*"
+        if sync_note:
+            env_txt += f" | {sync_note}"
         sb_badge = f"🌐 **Sandbox hiện tại:** `{active_env}`" if active_env else "🌐 **Sandbox hiện tại:** *(Chưa kết nối)*"
         sys_prompt = s_data.get("system_prompt", "")
         skills_dict = s_data.get("skills", {})
@@ -1164,6 +1397,11 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
     def on_delete_session(sessions, cur_id):
         if cur_id in active_sessions_agents:
+            if active_sessions_agents[cur_id].running_interaction_id:
+                try:
+                    active_sessions_agents[cur_id].cancel_interaction()
+                except Exception:
+                    pass
             del active_sessions_agents[cur_id]
 
         if not isinstance(sessions, dict) or not sessions:
@@ -1240,7 +1478,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
     )
     session_dropdown.change(
         on_switch_session,
-        inputs=[session_dropdown, sessions_state, current_session_id, system_instruction_input],
+        inputs=[session_dropdown, sessions_state, current_session_id, system_instruction_input, api_key_input],
         outputs=[sessions_state, current_session_id, session_title_md, session_env_info, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, current_sandbox_display]
     )
     delete_session_btn.click(
@@ -1274,13 +1512,19 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
     def handle_save_backup(sessions):
         return save_sessions_backup(sessions)
 
-    def handle_load_backup(sessions, cur_id):
+    def handle_load_backup(sessions, cur_id, api_key=""):
         loaded_data, first_id, choices, msg = load_sessions_backup()
         if not loaded_data:
             return (
                 sessions, cur_id, gr.update(), msg, gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
             )
+
+        # Tự động đồng bộ các tác vụ ngầm cho các phiên được khôi phục
+        for sid, sinfo in loaded_data.items():
+            if sinfo.get("running_interaction_id"):
+                loaded_data[sid], _ = check_and_recover_running_interaction(sinfo, api_key)
+
         first_s = loaded_data[first_id]
         first_name = first_s.get("name", "Phiên #1")
         first_skills = first_s.get("skills", {})
@@ -1318,7 +1562,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
     save_backup_btn.click(handle_save_backup, inputs=[sessions_state], outputs=[backup_status])
     load_backup_btn.click(
         handle_load_backup,
-        inputs=[sessions_state, current_session_id],
+        inputs=[sessions_state, current_session_id, api_key_input],
         outputs=[sessions_state, current_session_id, session_dropdown, backup_status, chatbot, system_instruction_input, active_skills_display, remove_skill_dropdown, session_title_md, session_env_info, current_sandbox_display]
     )
     export_md_btn.click(handle_export_markdown, inputs=[sessions_state, current_session_id], outputs=[backup_status])
@@ -1415,7 +1659,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
         return {"text": "", "files": []}, new_history, sessions
 
-    def bot_msg(history, sessions, cur_id, api_key, agent_choice, custom_agent_text, sys_prompt):
+    def bot_msg(history, sessions, cur_id, api_key, agent_choice, custom_agent_text, sys_prompt, background_mode=True):
         if not history:
             return
         active_key = api_key.strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
@@ -1512,46 +1756,152 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                     if not ok_up:
                         upload_file_to_cloud_sandbox(active_key, agent_sess.env_id, pf["filename"], pf["bytes"], pf.get("mime"))
 
-            # Gửi yêu cầu tới Agent (Hỗ trợ Self-Healing tự tạo Sandbox mới nếu Sandbox cũ bị 404/Expired)
-            interaction = agent_sess.ask(agent_input, system_instruction=sys_prompt, skills=current_skills, extra_sources=extra_sources)
+            # 1. Gửi yêu cầu với background (Background Execution trên Cloud hoặc Chạy đồng bộ)
+            is_bg = bool(background_mode)
+            interaction = agent_sess.ask(
+                agent_input,
+                system_instruction=sys_prompt,
+                skills=current_skills,
+                extra_sources=extra_sources,
+                background=is_bg,
+                wait_until_complete=False
+            )
 
-            # Cập nhật Sandbox ID và Interaction ID thực tế sau khi thực thi
+            current_inter_id = agent_sess.running_interaction_id or getattr(interaction, "id", None)
+            clean_inter_id = current_inter_id.replace("interactions/", "").strip() if current_inter_id else "unknown"
+
+            # Cập nhật ID phiên và Sandbox ID ban đầu
             sessions[cur_id]["env_id"] = agent_sess.env_id
-            sessions[cur_id]["last_interaction_id"] = agent_sess.last_interaction_id
+            sessions[cur_id]["last_interaction_id"] = current_inter_id
+            sessions[cur_id]["running_interaction_id"] = clean_inter_id if is_bg else None
+            sessions[cur_id]["cancel_requested"] = False
+            agent_sess.cancel_requested = False
+            try:
+                save_sessions_backup(sessions)
+            except Exception:
+                pass
 
             # Đảm bảo các tệp đính kèm cũng được ghi nhận vào Sandbox nếu vừa được cấp phát mới
             if agent_sess.env_id and pending_files:
                 for pf in pending_files:
                     upload_file_to_cloud_sandbox(active_key, agent_sess.env_id, f"workspace/{pf['filename']}", pf["bytes"], pf.get("mime"))
 
-            steps_markdown = format_interaction_steps(interaction)
-            final_output = interaction.output_text or "*(Đã hoàn thành tác vụ)*"
-
             auto_notice = ""
             if agent_sess.auto_recreated:
                 old_id_str = f"`{agent_sess.old_expired_id}`" if agent_sess.old_expired_id else "cũ"
                 auto_notice = f"> 💡 **Tự động phục hồi:** Sandbox {old_id_str} đã hết hạn trên Google Cloud. Hệ thống đã tự động cấp phát Sandbox mới (`{agent_sess.env_id}`) để câu hỏi của bạn được xử lý liền mạch mà không gặp lỗi!\n\n"
 
-            final_reply = f"{auto_notice}{steps_markdown}{final_output}" if steps_markdown else f"{auto_notice}{final_output}"
+            # 2. Vòng lặp cập nhật tiến trình thời gian thực (Real-time Progress Streaming Generator)
+            status = getattr(interaction, "status", "completed" if not is_bg else "in_progress")
+            poll_interval = 2.0
+            max_timeout = 600.0  # Tối đa 10 phút cho các tác vụ Agent chuyên sâu
 
+            while status == "in_progress" and (time.time() - start_ts) < max_timeout:
+                if sessions.get(cur_id, {}).get("cancel_requested") or getattr(agent_sess, "cancel_requested", False):
+                    status = "cancelled"
+                    break
+                elapsed_sec = time.time() - start_ts
+                intermediate_steps_md = format_interaction_steps(interaction)
+
+                progress_card = (
+                    f"{auto_notice}"
+                    f"⚡ **[Background Execution] Agent đang xử lý trên Google Cloud**\n"
+                    f"- 🆔 **Interaction ID:** `{clean_inter_id}`\n"
+                    f"- 🌐 **Sandbox ID:** `{agent_sess.env_id or 'Đang cấp phát...'}`\n"
+                    f"- ⏱️ **Thời gian đã chạy:** `{elapsed_sec:.1f}s`\n"
+                    f"- 🔄 **Trạng thái:** 🟡 *Đang thực thi các bước (suy luận / shell / file / search)...*\n\n"
+                )
+                if intermediate_steps_md:
+                    progress_card += f"{intermediate_steps_md}\n"
+
+                history[-1]["content"] = progress_card
+                sessions[cur_id]["history"] = history
+
+                env_info = f"⚡ **Tác vụ nền:** `{clean_inter_id}` (⏱️ {elapsed_sec:.0f}s | Sandbox: `{agent_sess.env_id}`)"
+                sb_badge = f"🌐 **Sandbox hiện tại:** `{agent_sess.env_id}`"
+                yield history, sessions, env_info, sb_badge
+
+                time.sleep(poll_interval)
+
+                try:
+                    interaction = agent_sess.get_interaction(clean_inter_id)
+                    status = getattr(interaction, "status", "in_progress")
+                except Exception:
+                    # Tiếp tục thử lại nếu gặp chập chờn mạng tạm thời
+                    pass
+
+            # 3. Xử lý kết quả sau khi Agent hoàn thành
             elapsed_sec = time.time() - start_ts
             finish_time_str = get_current_time_str()
-            time_footer = f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 8px; border-top: 1px dashed rgba(128,128,128,0.25); padding-top: 4px;">🕒 <i>Hoàn thành: {finish_time_str} • Thời gian xử lý: {elapsed_sec:.1f}s</i></div>'
-            final_reply = f"{final_reply}{time_footer}"
+            sessions[cur_id]["running_interaction_id"] = None
+            sessions[cur_id]["cancel_requested"] = False
+            agent_sess.cancel_requested = False
 
-            history[-1]["content"] = final_reply
-            history[-1]["time"] = finish_time_str
-            sessions[cur_id]["history"] = history
+            if status == "completed":
+                steps_markdown = format_interaction_steps(interaction)
+                final_output = getattr(interaction, "output_text", None) or "*(Đã hoàn thành tác vụ)*"
+                mode_label = "Background Execution ⚡" if is_bg else "Đồng bộ (Standard) ⏱️"
 
-            # Tự động sao lưu phiên làm việc xuống đĩa sau mỗi lượt chat (Auto-Persistence)
-            try:
-                save_sessions_backup(sessions)
-            except Exception:
-                pass
+                time_footer = (
+                    f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 8px; border-top: 1px dashed rgba(128,128,128,0.25); padding-top: 4px;">'
+                    f'🕒 <i>Hoàn thành: {finish_time_str} • Thời gian xử lý: {elapsed_sec:.1f}s • Chế độ: {mode_label}</i></div>'
+                )
+                final_reply = f"{auto_notice}{steps_markdown}{final_output}{time_footer}" if steps_markdown else f"{auto_notice}{final_output}{time_footer}"
 
-            env_info = f"🌐 **Sandbox ID:** `{agent_sess.env_id}` (Lượt #{agent_sess.step} | Agent: `{chosen_agent}` | Skills: {len(current_skills)})"
-            sb_badge = f"🌐 **Sandbox hiện tại:** `{agent_sess.env_id}`"
-            yield history, sessions, env_info, sb_badge
+                history[-1]["content"] = final_reply
+                history[-1]["time"] = finish_time_str
+                sessions[cur_id]["history"] = history
+                sessions[cur_id]["env_id"] = agent_sess.env_id
+                sessions[cur_id]["last_interaction_id"] = agent_sess.last_interaction_id
+
+                # Tự động sao lưu phiên làm việc xuống đĩa (Auto-Persistence)
+                try:
+                    save_sessions_backup(sessions)
+                except Exception:
+                    pass
+
+                env_info = f"🌐 **Sandbox ID:** `{agent_sess.env_id}` (Lượt #{agent_sess.step} | Agent: `{chosen_agent}` | Skills: {len(current_skills)})"
+                sb_badge = f"🌐 **Sandbox hiện tại:** `{agent_sess.env_id}`"
+                yield history, sessions, env_info, sb_badge
+
+            elif status == "requires_action":
+                steps_markdown = format_interaction_steps(interaction)
+                history[-1]["content"] = (
+                    f"{auto_notice}{steps_markdown}"
+                    f"⚠️ **Tác vụ yêu cầu xác nhận (requires_action):** Agent đang chờ phản hồi hoặc cấp quyền từ bạn.\n\n"
+                    f"<div style=\"font-size: 0.78rem; opacity: 0.65; margin-top: 8px;\">🕒 <i>{finish_time_str} • Thời gian: {elapsed_sec:.1f}s</i></div>"
+                )
+                history[-1]["time"] = finish_time_str
+                sessions[cur_id]["history"] = history
+                yield history, sessions, "⚠️ *Cần phản hồi từ bạn*", gr.update()
+
+            elif status == "cancelled":
+                steps_markdown = format_interaction_steps(interaction)
+                history[-1]["content"] = (
+                    f"{auto_notice}{steps_markdown}"
+                    f"🛑 **Tác vụ đã được hủy (Cancelled):** Tương tác `{clean_inter_id}` đã dừng lại theo yêu cầu.\n\n"
+                    f"<div style=\"font-size: 0.78rem; opacity: 0.65; margin-top: 8px;\">🕒 <i>{finish_time_str} • Thời gian: {elapsed_sec:.1f}s</i></div>"
+                )
+                history[-1]["time"] = finish_time_str
+                sessions[cur_id]["history"] = history
+                yield history, sessions, "🛑 *Tác vụ đã bị hủy*", gr.update()
+
+            elif status == "failed":
+                err_detail = getattr(interaction, "error", "Không xác định")
+                steps_markdown = format_interaction_steps(interaction)
+                history[-1]["content"] = (
+                    f"{auto_notice}{steps_markdown}"
+                    f"❌ **Tác vụ thất bại trên Google Cloud (Failed):** {err_detail}\n\n"
+                    f"<div style=\"font-size: 0.78rem; opacity: 0.65; margin-top: 8px;\">🕒 <i>{finish_time_str} • Thời gian: {elapsed_sec:.1f}s</i></div>"
+                )
+                history[-1]["time"] = finish_time_str
+                sessions[cur_id]["history"] = history
+                yield history, sessions, "❌ *Tác vụ thất bại*", gr.update()
+
+            elif (time.time() - start_ts) >= max_timeout:
+                history[-1]["content"] = f"⚠️ **Thời gian chờ vượt quá giới hạn ({max_timeout}s)**: Tác vụ `{clean_inter_id}` vẫn đang tiếp tục xử lý trên Cloud nhưng UI đã ngắt theo dõi. Bạn có thể kiểm tra lại sau."
+                sessions[cur_id]["history"] = history
+                yield history, sessions, "⚠️ *Timeout theo dõi*", gr.update()
 
         except Exception as e:
             elapsed_sec = time.time() - start_ts
@@ -1568,21 +1918,73 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             sessions[cur_id]["history"] = history
             yield history, sessions, "❌ *Lỗi thực thi*", gr.update()
 
-    # Submit Chat
-    msg_input.submit(
+    # --- Hàm xử lý dừng / hủy tác vụ (Cancel Task) ---
+    def on_cancel_task(sessions, cur_id, api_key):
+        if not isinstance(sessions, dict) or cur_id not in sessions:
+            return sessions, "⚠️ Không tìm thấy phiên làm việc.", gr.update()
+
+        target_inter_id = sessions[cur_id].get("running_interaction_id")
+        agent_sess = active_sessions_agents.get(cur_id)
+        if not target_inter_id and agent_sess:
+            target_inter_id = agent_sess.running_interaction_id
+
+        if not target_inter_id:
+            return sessions, "ℹ️ Không có tác vụ ngầm nào đang chạy trong phiên này.", gr.update()
+
+        clean_inter_id = str(target_inter_id).replace("interactions/", "").strip()
+        sessions[cur_id]["cancel_requested"] = True
+
+        # Gửi tín hiệu hủy tới Google Cloud
+        if agent_sess:
+            agent_sess.cancel_requested = True
+            try:
+                agent_sess.cancel_interaction(clean_inter_id)
+            except Exception as e:
+                print(f"[Cancel Error]: {e}")
+        else:
+            effective_key = (api_key or "").strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
+            if effective_key:
+                try:
+                    tmp_sess = ManagedAgentSession(api_key=effective_key)
+                    tmp_sess.cancel_interaction(clean_inter_id)
+                except Exception as e:
+                    print(f"[Cancel REST Error]: {e}")
+
+        history = sessions[cur_id].get("history", [])
+        if history and len(history) > 0 and history[-1].get("role") == "assistant":
+            history[-1]["content"] += f"\n\n🛑 *Đã gửi yêu cầu dừng tác vụ `{clean_inter_id}` đến Google Cloud.*"
+            history[-1]["time"] = get_current_time_str()
+
+        sessions[cur_id]["running_interaction_id"] = None
+        try:
+            save_sessions_backup(sessions)
+        except Exception:
+            pass
+
+        return sessions, f"🛑 **Đã gửi lệnh hủy tác vụ:** `{clean_inter_id}`", history
+
+    # Submit Chat & Cancel Events
+    msg_submit_event = msg_input.submit(
         user_msg, [msg_input, chatbot, sessions_state, current_session_id],
         [msg_input, chatbot, sessions_state], queue=False
     ).then(
-        bot_msg, [chatbot, sessions_state, current_session_id, api_key_input, agent_select, custom_agent_box, system_instruction_input],
+        bot_msg, [chatbot, sessions_state, current_session_id, api_key_input, agent_select, custom_agent_box, system_instruction_input, background_mode_chk],
         [chatbot, sessions_state, session_env_info, current_sandbox_display]
     )
 
-    submit_btn.click(
+    submit_click_event = submit_btn.click(
         user_msg, [msg_input, chatbot, sessions_state, current_session_id],
         [msg_input, chatbot, sessions_state], queue=False
     ).then(
-        bot_msg, [chatbot, sessions_state, current_session_id, api_key_input, agent_select, custom_agent_box, system_instruction_input],
+        bot_msg, [chatbot, sessions_state, current_session_id, api_key_input, agent_select, custom_agent_box, system_instruction_input, background_mode_chk],
         [chatbot, sessions_state, session_env_info, current_sandbox_display]
+    )
+
+    cancel_btn.click(
+        on_cancel_task,
+        inputs=[sessions_state, current_session_id, api_key_input],
+        outputs=[sessions_state, session_env_info, chatbot],
+        cancels=[submit_click_event, msg_submit_event]
     )
 
 if __name__ == "__main__":
