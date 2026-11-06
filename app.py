@@ -145,7 +145,7 @@ class ManagedAgentSession:
         self.agent = agent
         self.system_instruction = system_instruction.strip() if system_instruction else ""
         self.skills = skills.copy() if skills else {}
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         self.env_id = env_id.replace("environments/", "").strip() if env_id else None
         self.last_interaction_id = last_interaction_id
         self.running_interaction_id = None
@@ -375,7 +375,7 @@ def upload_file_to_cloud_sandbox(api_key: str, env_id: str, remote_path: str, da
 
     # 1. Thử qua google-genai SDK
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         if hasattr(client, "environments") and hasattr(client.environments, "files") and hasattr(client.environments.files, "upload"):
             client.environments.files.upload(
                 environment=clean_env,
@@ -535,7 +535,7 @@ def download_file_from_sandbox(api_key: str, cur_id: str, selected_file: str, cu
 
     # 1. Thử dùng SDK chính thức
     try:
-        client = genai.Client(api_key=key)
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
         data = client.environments.files.download(environment=clean_env, path=clean_path)
     except Exception as e:
         err_log.append(f"SDK: {e}")
