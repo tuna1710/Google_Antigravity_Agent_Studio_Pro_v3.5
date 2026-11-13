@@ -196,22 +196,25 @@ class ManagedAgentSession:
             sources.extend(extra_sources)
 
         clean_id = self.env_id.replace("environments/", "").strip() if self.env_id else None
+        is_deep_research = str(self.agent or "").startswith("deep-research")
 
-        if not clean_id:
-            if sources:
+        if not is_deep_research:
+            if not clean_id:
+                if sources:
+                    kwargs["environment"] = {
+                        "type": "remote",
+                        "sources": sources
+                    }
+                else:
+                    kwargs["environment"] = "remote"
+            else:
                 kwargs["environment"] = {
                     "type": "remote",
-                    "sources": sources
+                    "environment_id": clean_id
                 }
-            else:
-                kwargs["environment"] = "remote"
-        else:
-            kwargs["environment"] = {
-                "type": "remote",
-                "environment_id": clean_id
-            }
-            if self.last_interaction_id:
-                kwargs["previous_interaction_id"] = self.last_interaction_id
+
+        if self.last_interaction_id:
+            kwargs["previous_interaction_id"] = self.last_interaction_id
 
         def _record_interaction(inter):
             if inter:
@@ -219,7 +222,8 @@ class ManagedAgentSession:
                 inter_id = getattr(inter, "id", None)
                 if inter_id:
                     self.last_interaction_id = inter_id
-                if getattr(inter, "status", None) == "in_progress":
+                st = getattr(inter, "status", None)
+                if st in ("in_progress", "queued"):
                     self.running_interaction_id = self.last_interaction_id
                 else:
                     self.running_interaction_id = None
@@ -265,16 +269,38 @@ class ManagedAgentSession:
 
     def get_interaction(self, interaction_id: str = None):
         """
-        Lấy thông tin và trạng thái hiện tại của Interaction từ Google Cloud (GET /interactions/{id}).
+        Lấy thông tin và trạng thái hiện tại của Interaction từ Google Cloud (GET /v1beta/interactions/{id}).
+        Có fallback trực tiếp qua REST API nếu SDK gặp lỗi parse hoặc kết nối.
         """
         target_id = interaction_id or self.running_interaction_id or self.last_interaction_id
         if not target_id:
             return None
         clean_id = target_id.replace("interactions/", "").strip()
-        inter = self.client.interactions.get(id=clean_id)
+        inter = None
+        try:
+            inter = self.client.interactions.get(id=clean_id)
+        except Exception as sdk_err:
+            url = f"https://generativelanguage.googleapis.com/v1beta/interactions/{clean_id}"
+            headers = {
+                "x-goog-api-key": self.api_key,
+                "Content-Type": "application/json",
+            }
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                from types import SimpleNamespace
+                def _to_ns(obj):
+                    if isinstance(obj, dict):
+                        return SimpleNamespace(**{k: _to_ns(v) for k, v in obj.items()})
+                    if isinstance(obj, list):
+                        return [_to_ns(x) for x in obj]
+                    return obj
+                inter = _to_ns(resp.json())
+            else:
+                raise RuntimeError(f"SDK error: {sdk_err} | REST HTTP {resp.status_code}: {resp.text}")
+
         if getattr(inter, "environment_id", None):
             self.env_id = inter.environment_id
-        if getattr(inter, "status", None) != "in_progress":
+        if getattr(inter, "status", None) not in ("in_progress", "queued"):
             if self.running_interaction_id == clean_id:
                 self.running_interaction_id = None
             self.last_interaction_id = getattr(inter, "id", None) or clean_id
@@ -300,8 +326,7 @@ class ManagedAgentSession:
                 url = f"https://generativelanguage.googleapis.com/v1beta/interactions/{clean_id}/cancel"
                 headers = {
                     "x-goog-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                    "Api-Revision": "2026-05-20"
+                    "Content-Type": "application/json"
                 }
                 resp = requests.post(url, headers=headers, timeout=10)
                 if resp.status_code in (200, 204):
@@ -327,7 +352,7 @@ class ManagedAgentSession:
             if callback and callable(callback):
                 callback(inter)
             status = getattr(inter, "status", None)
-            if status != "in_progress":
+            if status not in ("in_progress", "queued"):
                 return inter
             time.sleep(poll_interval)
 
@@ -418,18 +443,69 @@ def sync_skill_to_active_sandbox(api_key: str, env_id: str, skill_name: str, ski
         return True, f"Đã đồng bộ `{remote_path}` vào Sandbox Cloud thành công!"
     return False, msg
 
+# --- Hàm trích xuất nội dung trả lời và lỗi từ Interaction (chuẩn v1beta) ---
+def extract_interaction_output_text(interaction) -> str:
+    if not interaction:
+        return ""
+    out_txt = getattr(interaction, "output_text", None)
+    if out_txt and str(out_txt).strip():
+        return str(out_txt)
+
+    # Fallback 1: Trích xuất từ steps (ModelOutputStep -> content -> text)
+    texts = []
+    for step in (getattr(interaction, "steps", None) or []):
+        step_type = getattr(step, "type", "") or step.__class__.__name__
+        if step_type == "model_output" or "ModelOutput" in step_type:
+            for item in (getattr(step, "content", None) or []):
+                t = getattr(item, "text", None)
+                if t and str(t).strip():
+                    texts.append(str(t))
+
+    # Fallback 2: Trích xuất từ outputs (nếu SDK/REST trả về trường outputs)
+    if not texts:
+        for item in (getattr(interaction, "outputs", None) or []):
+            t = getattr(item, "text", None)
+            if t and str(t).strip():
+                texts.append(str(t))
+
+    return "\n\n".join(texts).strip()
+
+def extract_interaction_errors(interaction) -> str:
+    if not interaction:
+        return "Không xác định"
+    errs = getattr(interaction, "errors", None)
+    if errs:
+        parts = []
+        for e in errs:
+            code = getattr(e, "code", None)
+            msg = getattr(e, "message", None)
+            if code and msg:
+                parts.append(f"[{code}] {msg}")
+            elif msg:
+                parts.append(str(msg))
+            else:
+                parts.append(str(e))
+        if parts:
+            return "; ".join(parts)
+    single_err = getattr(interaction, "error", None)
+    return str(single_err) if single_err else "Không xác định"
+
 # --- Bộ xử lý bóc tách các bước tư duy, lệnh thực thi và kết quả công cụ ---
 def format_interaction_steps(interaction):
-    steps = getattr(interaction, "steps", []) or []
+    steps = getattr(interaction, "steps", None) or []
     thought_blocks = []
     exec_blocks = []
 
     for idx, step in enumerate(steps, start=1):
         step_type = getattr(step, "type", "") or step.__class__.__name__
 
+        # Bỏ qua bước input/output cuối (đã hiển thị riêng)
+        if step_type in ("user_input", "model_output") or "UserInput" in step_type or "ModelOutput" in step_type:
+            continue
+
         # 1. Thought Step (Tư duy)
         if step_type == "thought" or "Thought" in step_type:
-            summary = getattr(step, "summary", [])
+            summary = getattr(step, "summary", None) or []
             for item in summary:
                 txt = getattr(item, "text", str(item)).strip()
                 if txt:
@@ -458,7 +534,16 @@ def format_interaction_steps(interaction):
             res = getattr(step, "result", "")
             exec_blocks.append(f"📄 **Kết quả Google Search:**\n```text\n{str(res)[:600]}\n```")
 
-        # 4. Function / Tool Calls
+        # 4. URL Context / File Search / MCP / Retrieval Calls
+        elif step_type in ("url_context_call", "file_search_call", "mcp_server_tool_call", "retrieval_call") or any(k in step_type for k in ("URLContextCall", "FileSearchCall", "MCPServerToolCall", "RetrievalCall")):
+            args = getattr(step, "arguments", None) or getattr(step, "name", "")
+            exec_blocks.append(f"🌐 **[Bước {idx}] {step_type}:** `{str(args)[:300]}`")
+
+        elif step_type in ("url_context_result", "file_search_result", "mcp_server_tool_result", "retrieval_result") or any(k in step_type for k in ("URLContextResult", "FileSearchResult", "MCPServerToolResult", "RetrievalResult")):
+            res = getattr(step, "result", "")
+            exec_blocks.append(f"📥 **Kết quả ({step_type}):**\n```text\n{str(res)[:600]}\n```")
+
+        # 5. Function / Tool Calls
         elif "FunctionCall" in step_type or step_type == "function_call":
             call = getattr(step, "call", getattr(step, "name", str(step)))
             exec_blocks.append(f"🛠️ **[Bước {idx}] Gọi Tool:** `{call}`")
@@ -468,8 +553,8 @@ def format_interaction_steps(interaction):
             exec_blocks.append(f"📦 **Kết quả Tool:**\n```text\n{str(res)[:600]}\n```")
 
         # Fallback summary
-        elif hasattr(step, "summary") and step.summary:
-            for item in step.summary:
+        elif getattr(step, "summary", None):
+            for item in (getattr(step, "summary", None) or []):
                 txt = getattr(item, "text", str(item)).strip()
                 if txt:
                     thought_blocks.append(txt)
@@ -486,6 +571,39 @@ def format_interaction_steps(interaction):
     return result_md
 
 # --- Quản lý Tệp Sandbox (File Explorer) ---
+def _fetch_sandbox_files(key: str, clean_env: str):
+    """Lấy danh sách tệp trong Sandbox (ưu tiên SDK google-genai, fallback REST API v1beta)."""
+    try:
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        if hasattr(client, "environments") and hasattr(client.environments, "files"):
+            resp = client.environments.files.list(environment=clean_env, path="", recursive=True)
+            files_obj = getattr(resp, "files", None) or []
+            result = []
+            for f in files_obj:
+                result.append({
+                    "name": getattr(f, "path", None) or getattr(f, "name", None),
+                    "size_bytes": getattr(f, "size_bytes", None),
+                    "type": str(getattr(f, "type", "") or "file"),
+                })
+            return result, None
+    except Exception:
+        pass
+
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_env}/files"
+    res = requests.get(url, headers=headers, timeout=10)
+    if res.status_code != 200:
+        return None, f"⚠️ Lỗi Google API ({res.status_code}): {res.text}"
+    raw_files = res.json().get("files", [])
+    result = []
+    for f in raw_files:
+        result.append({
+            "name": f.get("path") or f.get("name"),
+            "size_bytes": f.get("sizeBytes") if f.get("sizeBytes") is not None else f.get("size_bytes"),
+            "type": str(f.get("type", "file")),
+        })
+    return result, None
+
 def list_sandbox_files(api_key: str, cur_id: str, sessions=None):
     key = api_key.strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
     env_id = get_current_env_id(cur_id, sessions)
@@ -495,24 +613,28 @@ def list_sandbox_files(api_key: str, cur_id: str, sessions=None):
         return gr.update(choices=[]), "ℹ️ Phiên này chưa gửi câu hỏi nào hoặc chưa gắn Sandbox Cloud."
 
     clean_env = env_id.replace("environments/", "").strip()
-    target = f"environments/{clean_env}"
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = f"https://generativelanguage.googleapis.com/v1beta/{target}/files"
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            return gr.update(choices=[]), f"⚠️ Lỗi Google API ({res.status_code}): {res.text}"
-        files_data = res.json().get("files", [])
+        files_data, err_msg = _fetch_sandbox_files(key, clean_env)
+        if err_msg:
+            return gr.update(choices=[]), err_msg
         if not files_data:
             return gr.update(choices=[]), f"📁 Sandbox `{clean_env}` hiện tại chưa có tệp nào."
 
         file_list = []
         md_lines = [f"### 📂 Danh sách tệp trong Sandbox (`{clean_env}`):\n"]
         for idx, f in enumerate(files_data, start=1):
-            name = f.get("name") or f.get("path") or f"file_{idx}"
-            size = f.get("sizeBytes") or f.get("size_bytes", "0")
-            file_list.append(name)
-            md_lines.append(f"{idx}. 📄 `{name}` — **{int(size):,} bytes**")
+            name = f.get("name") or f"file_{idx}"
+            ftype = f.get("type", "file")
+            raw_size = f.get("size_bytes")
+            try:
+                size_str = f"{int(raw_size):,} bytes" if raw_size is not None else "—"
+            except (ValueError, TypeError):
+                size_str = "—"
+            if ftype == "directory":
+                md_lines.append(f"{idx}. 📁 `{name}/` *(Thư mục)*")
+            else:
+                file_list.append(name)
+                md_lines.append(f"{idx}. 📄 `{name}` — **{size_str}**")
         return gr.update(choices=file_list, value=file_list[0] if file_list else None), "\n".join(md_lines)
     except Exception as e:
         return gr.update(choices=[]), f"❌ Lỗi truy vấn tệp: {str(e)}"
@@ -597,22 +719,72 @@ def upload_file_to_sandbox(api_key: str, cur_id: str, upload_obj, colab_path_inp
         return f"❌ Lỗi khi tải tệp lên Sandbox: {msg}"
 
 # --- Quản lý & Kết nối Sandbox Cloud Google (Quay lại Sandbox cũ / Xóa chọn lọc / Kiểm tra trạng thái) ---
+def _list_cloud_environments(key: str, page_size: int = 50):
+    """Liệt kê Sandbox Cloud (ưu tiên SDK google-genai, fallback REST API v1beta)."""
+    try:
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        if hasattr(client, "environments") and hasattr(client.environments, "list"):
+            resp = client.environments.list(page_size=page_size)
+            envs_obj = getattr(resp, "environments", None)
+            if envs_obj is None and isinstance(resp, list):
+                envs_obj = resp
+            if envs_obj is not None:
+                out = []
+                for env in envs_obj:
+                    raw_id = getattr(env, "id", None) or getattr(env, "name", None) or ""
+                    out.append({
+                        "id": str(raw_id).replace("environments/", "").strip(),
+                        "status": str(getattr(env, "status", "unknown") or "unknown"),
+                        "file_count": getattr(env, "file_count", 0) or 0,
+                    })
+                return out, None
+    except Exception:
+        pass
+
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/environments?pageSize={page_size}"
+    res = requests.get(url, headers=headers, timeout=10)
+    if res.status_code != 200:
+        return None, f"⚠️ Lỗi kết nối Google API ({res.status_code}): {res.text}"
+    out = []
+    for env in res.json().get("environments", []):
+        raw_id = env.get("name") or env.get("id") or env.get("environmentId", "")
+        out.append({
+            "id": str(raw_id).replace("environments/", "").strip(),
+            "status": str(env.get("status", "unknown") or "unknown"),
+            "file_count": env.get("file_count") if env.get("file_count") is not None else env.get("fileCount", 0),
+        })
+    return out, None
+
+def _delete_cloud_environment(key: str, clean_id: str) -> tuple[bool, str]:
+    """Xóa Sandbox Cloud (ưu tiên SDK google-genai, fallback REST API v1beta)."""
+    try:
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        if hasattr(client, "environments") and hasattr(client.environments, "delete"):
+            client.environments.delete(clean_id)
+            return True, ""
+    except Exception:
+        pass
+
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_id}"
+    res = requests.delete(url, headers=headers, timeout=10)
+    if res.status_code in (200, 204):
+        return True, ""
+    return False, f"({res.status_code}): {res.text}"
+
 def get_all_cloud_sandboxes(api_key: str):
     key = api_key.strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
     if not key:
         return [], "⚠️ Vui lòng nhập Gemini API Key để quét Sandbox."
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = "https://generativelanguage.googleapis.com/v1beta/environments?pageSize=50"
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            return [], f"⚠️ Lỗi kết nối Google API ({res.status_code}): {res.text}"
-        envs = res.json().get("environments", [])
+        envs, err_msg = _list_cloud_environments(key, page_size=50)
+        if err_msg:
+            return [], err_msg
         env_choices = []
         active_count = 0
         for env in envs:
-            raw_id = env.get("name") or env.get("id") or env.get("environmentId", "")
-            clean_id = raw_id.replace("environments/", "").strip()
+            clean_id = env.get("id", "")
             if clean_id:
                 status = env.get("status", "unknown")
                 file_cnt = env.get("file_count", 0)
@@ -643,19 +815,27 @@ def attach_to_existing_sandbox(api_key: str, cur_id: str, selected_sandbox: str,
     clean_target = target.replace("environments/", "").strip()
 
     # Kiểm tra trạng thái Sandbox trên Google Cloud trước khi kết nối
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_target}"
+    status = ""
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 404:
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        env_obj = client.environments.get(clean_target)
+        status = str(getattr(env_obj, "status", "") or "")
+    except Exception as sdk_err:
+        if "404" in str(sdk_err) or "not found" in str(sdk_err).lower():
             return sessions, gr.update(), f"❌ Sandbox `{clean_target}` không tồn tại trên Google Cloud (có thể đã bị xóa hoặc sai ID).", gr.update()
-        elif res.status_code == 200:
-            env_info = res.json()
-            status = env_info.get("status", "")
-            if status == "expired":
-                return sessions, gr.update(), f"⚠️ Sandbox `{clean_target}` đã **HẾT HẠN (expired)** trên Google Cloud.\nGoogle tự động thu hồi Sandbox sau một khoảng thời gian không dùng. Vui lòng chọn một Sandbox có nhãn 🟢 Hoạt động hoặc gửi tin nhắn để hệ thống tự cấp phát Sandbox mới!", gr.update()
-    except Exception:
-        pass
+        try:
+            headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+            url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_target}"
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 404:
+                return sessions, gr.update(), f"❌ Sandbox `{clean_target}` không tồn tại trên Google Cloud (có thể đã bị xóa hoặc sai ID).", gr.update()
+            elif res.status_code == 200:
+                status = str(res.json().get("status", "") or "")
+        except Exception:
+            pass
+
+    if status == "expired":
+        return sessions, gr.update(), f"⚠️ Sandbox `{clean_target}` đã **HẾT HẠN (expired)** trên Google Cloud.\nGoogle tự động thu hồi Sandbox sau một khoảng thời gian không dùng. Vui lòng chọn một Sandbox có nhãn 🟢 Hoạt động hoặc gửi tin nhắn để hệ thống tự cấp phát Sandbox mới!", gr.update()
 
     # Cập nhật phiên với clean ID này
     sessions[cur_id]["env_id"] = clean_target
@@ -677,11 +857,9 @@ def delete_specific_sandbox(api_key: str, selected_sandbox: str, sessions, cur_i
         return sessions, gr.update(), gr.update(), "⚠️ Vui lòng chọn Sandbox cần xóa.", gr.update()
 
     clean_target = selected_sandbox.replace("environments/", "").strip()
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_target}"
     try:
-        res = requests.delete(url, headers=headers, timeout=10)
-        if res.status_code in (200, 204):
+        ok, err_txt = _delete_cloud_environment(key, clean_target)
+        if ok:
             if sessions.get(cur_id, {}).get("env_id") == clean_target:
                 sessions[cur_id]["env_id"] = None
             if cur_id in active_sessions_agents and active_sessions_agents[cur_id].env_id == clean_target:
@@ -697,7 +875,7 @@ def delete_specific_sandbox(api_key: str, selected_sandbox: str, sessions, cur_i
                 "ℹ️ *Chưa có Sandbox ID*"
             )
         else:
-            return sessions, gr.update(), gr.update(), f"❌ Không thể xóa Sandbox ({res.status_code}): {res.text}", gr.update()
+            return sessions, gr.update(), gr.update(), f"❌ Không thể xóa Sandbox {err_txt}", gr.update()
     except Exception as e:
         return sessions, gr.update(), gr.update(), f"❌ Lỗi khi xóa: {str(e)}", gr.update()
 
@@ -705,31 +883,29 @@ def inspect_cloud_sandboxes(api_key: str):
     key = api_key.strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
     if not key:
         return "⚠️ Vui lòng nhập Gemini API Key để kiểm tra."
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = "https://generativelanguage.googleapis.com/v1beta/environments?pageSize=50"
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            return f"⚠️ Lỗi kết nối Google API ({res.status_code}): {res.text}"
-        envs = res.json().get("environments", [])
+        envs, err_msg = _list_cloud_environments(key, page_size=50)
+        if err_msg:
+            return err_msg
         if not envs:
             return "🎉 Tài khoản sạch sẽ, không có sandbox nào."
         details = [f"### 📋 Chi tiết {len(envs)} Sandbox trên Google Cloud:\n"]
         for idx, env in enumerate(envs, start=1):
-            raw_id = env.get("name") or env.get("id") or env.get("environmentId", "")
-            clean_id = raw_id.replace("environments/", "").strip()
+            clean_id = env.get("id", "")
             status = env.get("status", "unknown")
             status_icon = "🟢 Hoạt động" if status == "active" else "🔴 Đã hết hạn"
             details.append(f"#### {idx}. Sandbox: `{clean_id}` ({status_icon})")
-            files_url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_id}/files"
             try:
-                f_res = requests.get(files_url, headers=headers, timeout=5)
-                if f_res.status_code == 200:
-                    files_data = f_res.json().get("files", [])
-                    if files_data:
-                        details.append(f"- **Tệp ({len(files_data)})**:\n  " + "\n  ".join(f"• `{f.get('name', 'file')}` ({f.get('sizeBytes', '0')} B)" for f in files_data[:15]))
-                    else:
-                        details.append("- **Tệp**: *(Trống)*")
+                files_data, f_err = _fetch_sandbox_files(key, clean_id)
+                if not f_err and files_data:
+                    lines_f = []
+                    for f in files_data[:15]:
+                        sz = f.get("size_bytes")
+                        sz_str = f"{int(sz)} B" if sz is not None else "—"
+                        lines_f.append(f"• `{f.get('name', 'file')}` ({sz_str})")
+                    details.append(f"- **Tệp ({len(files_data)})**:\n  " + "\n  ".join(lines_f))
+                elif not f_err:
+                    details.append("- **Tệp**: *(Trống)*")
                 else:
                     details.append("- **Tệp**: *(Không có tệp)*")
             except Exception:
@@ -743,23 +919,18 @@ def clean_all_cloud_sandboxes(api_key: str, sessions):
     key = api_key.strip() or colab_api_key or os.environ.get("GEMINI_API_KEY", "")
     if not key:
         return sessions, gr.update(choices=[], value=None), gr.update(choices=[], value=None), "⚠️ Vui lòng nhập Gemini API Key để thực hiện.", "ℹ️ *Chưa có Sandbox ID*"
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    url = "https://generativelanguage.googleapis.com/v1beta/environments?pageSize=50"
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code != 200:
-            return sessions, gr.update(choices=[]), gr.update(choices=[]), f"⚠️ Lỗi kết nối Google API ({res.status_code}): {res.text}", gr.update()
-        envs = res.json().get("environments", [])
+        envs, err_msg = _list_cloud_environments(key, page_size=50)
+        if err_msg:
+            return sessions, gr.update(choices=[]), gr.update(choices=[]), err_msg, gr.update()
         if not envs:
             return sessions, gr.update(choices=[]), gr.update(choices=[]), "🎉 Tài khoản sạch sẽ! Không có sandbox cloud nào cần xóa.", gr.update()
         deleted_count = 0
         for env in envs:
-            raw_id = env.get("name") or env.get("id") or env.get("environmentId", "")
-            clean_id = raw_id.replace("environments/", "").strip()
+            clean_id = env.get("id", "")
             if clean_id:
-                del_url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_id}"
-                del_res = requests.delete(del_url, headers=headers, timeout=10)
-                if del_res.status_code in (200, 204):
+                ok, _ = _delete_cloud_environment(key, clean_id)
+                if ok:
                     deleted_count += 1
         active_sessions_agents.clear()
         for s in sessions.values():
@@ -847,7 +1018,7 @@ def check_and_recover_running_interaction(s_data: dict, api_key: str = None) -> 
                 s_data["env_id"] = inter.environment_id
 
             steps_markdown = format_interaction_steps(inter)
-            final_output = getattr(inter, "output_text", None) or "*(Đã hoàn thành tác vụ)*"
+            final_output = extract_interaction_output_text(inter) or "*(Đã hoàn thành tác vụ)*"
             time_footer = (
                 f'\n\n<div style="font-size: 0.78rem; opacity: 0.65; margin-top: 8px; border-top: 1px dashed rgba(128,128,128,0.25); padding-top: 4px;">'
                 f'🕒 <i>Hoàn tất trong chế độ ngầm: {finish_time_str} • Tác vụ: `{clean_id}`</i></div>'
@@ -873,28 +1044,41 @@ def check_and_recover_running_interaction(s_data: dict, api_key: str = None) -> 
 
         elif status == "failed":
             s_data["running_interaction_id"] = None
-            err = getattr(inter, "error", "Không xác định")
+            err = extract_interaction_errors(inter)
             history = s_data.get("history", [])
             if history and history[-1].get("role") == "assistant":
                 history[-1]["content"] += f"\n\n❌ **Tác vụ thất bại trên Cloud:** {err}"
             s_data["history"] = history
             return s_data, f"❌ Tác vụ `{clean_id}` thất bại: {err}"
 
-        elif status == "in_progress":
+        elif status in ("incomplete", "budget_exceeded", "requires_continuation"):
+            s_data["running_interaction_id"] = None
+            steps_markdown = format_interaction_steps(inter)
+            partial_out = extract_interaction_output_text(inter)
+            history = s_data.get("history", [])
+            msg = f"{steps_markdown}{partial_out}\n\n⚠️ **Tác vụ dừng với trạng thái `{status}`.**" if partial_out else f"{steps_markdown}⚠️ **Tác vụ dừng với trạng thái `{status}`.**"
+            if history and history[-1].get("role") == "assistant":
+                history[-1]["content"] = msg
+                history[-1]["time"] = finish_time_str
+            s_data["history"] = history
+            return s_data, f"⚠️ Tác vụ `{clean_id}` dừng ở trạng thái `{status}`."
+
+        elif status in ("in_progress", "queued"):
             steps_markdown = format_interaction_steps(inter)
             history = s_data.get("history", [])
             if history and history[-1].get("role") == "assistant":
+                status_txt = "🟡 *Đang xếp hàng (Queued)...*" if status == "queued" else "🟡 *Đang thực thi các bước...*"
                 progress_card = (
                     f"⚡ **[Background Execution] Tác vụ vẫn đang tiếp tục xử lý trên Google Cloud**\n"
                     f"- 🆔 **Interaction ID:** `{clean_id}`\n"
                     f"- 🌐 **Sandbox ID:** `{s_data.get('env_id') or 'Đang cấp phát...'}`\n"
-                    f"- 🔄 **Trạng thái:** 🟡 *Đang thực thi các bước...*\n\n"
+                    f"- 🔄 **Trạng thái:** {status_txt}\n\n"
                 )
                 if steps_markdown:
                     progress_card += f"{steps_markdown}\n"
                 history[-1]["content"] = progress_card
                 s_data["history"] = history
-            return s_data, f"⚡ Tác vụ `{clean_id}` vẫn đang chạy ngầm trên Google Cloud."
+            return s_data, f"⚡ Tác vụ `{clean_id}` vẫn đang chạy ngầm trên Google Cloud ({status})."
 
     except Exception as e:
         return s_data, f"⚠️ Lỗi khi đồng bộ tác vụ `{clean_id}`: {e}"
@@ -975,11 +1159,11 @@ def export_session_markdown(sessions, cur_id):
         time_info = f" *(🕒 {turn['time']})*" if "time" in turn else ""
         lines.append(f"### {'👤 Bạn' if role == 'user' else '🛸 Agent'}{time_info}:\n{content}\n")
     safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in sess_name)
-    export_path = f"/content/{safe_name}_{cur_id[:6]}.md"
+    export_path = os.path.join(COLAB_DOWNLOAD_DIR, f"{safe_name}_{cur_id[:6]}.md")
     try:
         with open(export_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        return f"💾 **Đã xuất file Markdown thành công!**\n- Đường dẫn tại Colab: `{export_path}`"
+        return f"💾 **Đã xuất file Markdown thành công!**\n- Đường dẫn: `{export_path}`"
     except Exception as e:
         return f"❌ Lỗi xuất file: {str(e)}"
 
@@ -1795,13 +1979,22 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
             status = getattr(interaction, "status", "completed" if not is_bg else "in_progress")
             poll_interval = 2.0
             max_timeout = 600.0  # Tối đa 10 phút cho các tác vụ Agent chuyên sâu
+            consecutive_poll_errors = 0
+            last_poll_error = ""
+            max_consecutive_errors = 5
 
-            while status == "in_progress" and (time.time() - start_ts) < max_timeout:
+            while status in ("in_progress", "queued") and (time.time() - start_ts) < max_timeout:
                 if sessions.get(cur_id, {}).get("cancel_requested") or getattr(agent_sess, "cancel_requested", False):
                     status = "cancelled"
                     break
                 elapsed_sec = time.time() - start_ts
-                intermediate_steps_md = format_interaction_steps(interaction)
+                try:
+                    intermediate_steps_md = format_interaction_steps(interaction)
+                except Exception:
+                    intermediate_steps_md = ""
+
+                status_label = "🟡 *Đang xếp hàng trên Cloud (Queued)...*" if status == "queued" else "🟡 *Đang thực thi các bước (suy luận / shell / file / search)...*"
+                err_note = f"\n- ⚠️ **Cảnh báo mạng:** *Đang thử lại ({consecutive_poll_errors}/{max_consecutive_errors}):* `{last_poll_error[:120]}`" if consecutive_poll_errors > 0 else ""
 
                 progress_card = (
                     f"{auto_notice}"
@@ -1809,7 +2002,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                     f"- 🆔 **Interaction ID:** `{clean_inter_id}`\n"
                     f"- 🌐 **Sandbox ID:** `{agent_sess.env_id or 'Đang cấp phát...'}`\n"
                     f"- ⏱️ **Thời gian đã chạy:** `{elapsed_sec:.1f}s`\n"
-                    f"- 🔄 **Trạng thái:** 🟡 *Đang thực thi các bước (suy luận / shell / file / search)...*\n\n"
+                    f"- 🔄 **Trạng thái:** {status_label}{err_note}\n\n"
                 )
                 if intermediate_steps_md:
                     progress_card += f"{intermediate_steps_md}\n"
@@ -1826,9 +2019,13 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                 try:
                     interaction = agent_sess.get_interaction(clean_inter_id)
                     status = getattr(interaction, "status", "in_progress")
-                except Exception:
-                    # Tiếp tục thử lại nếu gặp chập chờn mạng tạm thời
-                    pass
+                    consecutive_poll_errors = 0
+                    last_poll_error = ""
+                except Exception as poll_err:
+                    consecutive_poll_errors += 1
+                    last_poll_error = str(poll_err)
+                    if consecutive_poll_errors >= max_consecutive_errors:
+                        raise RuntimeError(f"Mất kết nối hoặc lỗi API khi theo dõi tác vụ `{clean_inter_id}` ({max_consecutive_errors} lần liên tiếp): {last_poll_error}")
 
             # 3. Xử lý kết quả sau khi Agent hoàn thành
             elapsed_sec = time.time() - start_ts
@@ -1839,7 +2036,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
 
             if status == "completed":
                 steps_markdown = format_interaction_steps(interaction)
-                final_output = getattr(interaction, "output_text", None) or "*(Đã hoàn thành tác vụ)*"
+                final_output = extract_interaction_output_text(interaction) or "*(Đã hoàn thành tác vụ)*"
                 mode_label = "Background Execution ⚡" if is_bg else "Đồng bộ (Standard) ⏱️"
 
                 time_footer = (
@@ -1887,7 +2084,7 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                 yield history, sessions, "🛑 *Tác vụ đã bị hủy*", gr.update()
 
             elif status == "failed":
-                err_detail = getattr(interaction, "error", "Không xác định")
+                err_detail = extract_interaction_errors(interaction)
                 steps_markdown = format_interaction_steps(interaction)
                 history[-1]["content"] = (
                     f"{auto_notice}{steps_markdown}"
@@ -1897,6 +2094,19 @@ with gr.Blocks(title="Google Antigravity Agent Studio Pro") as demo:
                 history[-1]["time"] = finish_time_str
                 sessions[cur_id]["history"] = history
                 yield history, sessions, "❌ *Tác vụ thất bại*", gr.update()
+
+            elif status in ("incomplete", "budget_exceeded", "requires_continuation"):
+                steps_markdown = format_interaction_steps(interaction)
+                partial_output = extract_interaction_output_text(interaction)
+                partial_block = f"{partial_output}\n\n" if partial_output else ""
+                history[-1]["content"] = (
+                    f"{auto_notice}{steps_markdown}{partial_block}"
+                    f"⚠️ **Tác vụ dừng sớm trên Cloud (Trạng thái: `{status}`)**\n\n"
+                    f"<div style=\"font-size: 0.78rem; opacity: 0.65; margin-top: 8px;\">🕒 <i>{finish_time_str} • Thời gian: {elapsed_sec:.1f}s</i></div>"
+                )
+                history[-1]["time"] = finish_time_str
+                sessions[cur_id]["history"] = history
+                yield history, sessions, f"⚠️ *Trạng thái: {status}*", gr.update()
 
             elif (time.time() - start_ts) >= max_timeout:
                 history[-1]["content"] = f"⚠️ **Thời gian chờ vượt quá giới hạn ({max_timeout}s)**: Tác vụ `{clean_inter_id}` vẫn đang tiếp tục xử lý trên Cloud nhưng UI đã ngắt theo dõi. Bạn có thể kiểm tra lại sau."
